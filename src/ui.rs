@@ -1,8 +1,8 @@
 use crate::{
-    discovery::{Discovery, Outgoing},
-    host::{Host, VideoSettings},
+    discovery::{Device, Discovery, Outgoing},
+    host::VideoSettings,
     input::named_key,
-    protocol::{Button, Input, Modifiers, Pairing, is_local},
+    protocol::{Button, Input, Modifiers, SessionTicket, is_local},
     viewer::Viewer,
 };
 use eframe::egui::{self, Color32, Event, Rect, TextureHandle, TextureOptions};
@@ -24,11 +24,8 @@ pub struct Localnet {
     interfaces: Vec<(String, IpAddr)>,
     interface: usize,
     settings: VideoSettings,
-    host: Option<Host>,
     sessions: Vec<RemoteSession>,
     active: Option<usize>,
-    computer_name: String,
-    pairing: String,
     error: String,
     remote_rect: Option<Rect>,
     controlling: bool,
@@ -67,11 +64,8 @@ impl Localnet {
                 width: 1920,
                 quality: 70,
             },
-            host: None,
             sessions: Vec::new(),
             active: None,
-            computer_name: String::new(),
-            pairing: String::new(),
             error: String::new(),
             remote_rect: None,
             controlling: false,
@@ -86,13 +80,15 @@ impl Localnet {
     }
 
     pub fn enable_discovery(&mut self) {
-        match Discovery::start(self.interfaces[self.interface].1) {
+        match Discovery::start(self.interfaces[self.interface].1, self.settings) {
             Ok(discovery) => {
                 self.discovery = Some(discovery);
                 self.error.clear();
             }
             Err(e) => {
-                self.error = format!("Discovery unavailable: {e}. Manual pairing still works.")
+                self.error = format!(
+                    "Local access unavailable: {e:#}. Check the selected interface and close other Localnet instances."
+                )
             }
         }
     }
@@ -140,49 +136,57 @@ impl Localnet {
         }
     }
 
-    fn stop_sharing(&mut self) {
-        self.host.take();
-    }
-
     fn shutdown(&mut self) {
         self.release();
         self.events.clear();
         self.active = None;
         self.remote_rect = None;
         self.sessions.clear();
-        self.stop_sharing();
         self.outgoing.take();
         self.discovery.take();
     }
 
-    fn connect(&mut self, ctx: &egui::Context) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.sessions.len() < MAX_SESSIONS,
-            "Disconnect a session before adding another (maximum four)"
-        );
-        let pair = Pairing::decode(&self.pairing)?;
-        anyhow::ensure!(
-            !self
-                .sessions
-                .iter()
-                .any(|session| session.address == pair.address),
-            "This computer already has a session. Select it or disconnect it before reconnecting."
-        );
-        let name = self.computer_name.trim();
-        let name = if name.is_empty() {
-            pair.address.to_string()
-        } else {
-            name.to_owned()
-        };
-        self.connect_pair(pair, name, ctx)?;
-        self.pairing.clear();
-        self.computer_name.clear();
-        Ok(())
+    fn incoming_viewer(&self) -> bool {
+        self.discovery
+            .as_ref()
+            .is_some_and(|discovery| discovery.controller.state.lock().unwrap().has_viewer)
+    }
+
+    fn connect_device(&mut self, device: Device) {
+        if !device.compatible() {
+            self.error = format!(
+                "Update Localnet on {} and this computer to 0.2.0 or newer. The Mac/PC is still running the older pairing version.",
+                device.name
+            );
+            return;
+        }
+        if let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.address.ip() == device.address.ip())
+        {
+            if self.sessions[index].viewer.connected() {
+                self.select_session(index);
+                return;
+            }
+            self.select_session(index);
+            self.disconnect_active();
+        }
+        if self.outgoing.is_some() || self.sessions.len() >= MAX_SESSIONS {
+            self.error =
+                "Wait for the current connection or disconnect a computer first (maximum four)."
+                    .into();
+            return;
+        }
+        self.release();
+        self.events.clear();
+        self.outgoing = Some(Outgoing::start(device));
+        self.error.clear();
     }
 
     fn connect_pair(
         &mut self,
-        pair: Pairing,
+        pair: SessionTicket,
         name: String,
         ctx: &egui::Context,
     ) -> anyhow::Result<()> {
@@ -221,7 +225,7 @@ impl Localnet {
     fn route_input(&mut self) {
         let events = std::mem::take(&mut self.events);
         if !self.focused
-            || self.host.as_ref().is_some_and(Host::has_viewer)
+            || self.incoming_viewer()
             || !self
                 .active
                 .and_then(|index| self.sessions.get(index))
@@ -370,7 +374,7 @@ fn remote_modifiers(value: egui::Modifiers) -> Modifiers {
 
 impl eframe::App for Localnet {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        if (!raw.focused || self.host.as_ref().is_some_and(Host::has_viewer)) && self.controlling {
+        if (!raw.focused || self.incoming_viewer()) && self.controlling {
             self.release();
         }
         self.events.extend(raw.events.clone());
@@ -405,14 +409,6 @@ impl eframe::App for Localnet {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if self.host.as_ref().is_some_and(Host::approval_finished) {
-            self.stop_sharing();
-        }
-        if let Some(discovery) = &self.discovery {
-            discovery
-                .accepting
-                .store(self.host.is_none(), std::sync::atomic::Ordering::Relaxed);
-        }
         let result = self
             .outgoing
             .as_ref()
@@ -451,7 +447,7 @@ impl eframe::App for Localnet {
                     ui.heading("This computer");
                     ui.label(if cfg!(target_os = "macos") { "macOS / Local sharing" } else { "Windows / Local sharing" });
                     ui.heading("Nearby computers");
-                    ui.label("Discovery is not authorization. Every connection needs a fresh code and approval on the other computer.");
+                    ui.label("Trusted LAN mode: no pairing codes or approval. Computers running Localnet can connect automatically.");
                     if let Some(discovery) = &self.discovery {
                         let (status, mut devices) = { let state = discovery.state.lock().unwrap();
                             (state.status.clone(), state.devices.values().cloned().collect::<Vec<_>>()) };
@@ -460,42 +456,31 @@ impl eframe::App for Localnet {
                         if devices.is_empty() { ui.label("Open Localnet on your other computers. They will appear here automatically."); }
                         for device in devices {
                             ui.label(format!("{} ({})", device.name, device.address.ip()));
-                            if ui.add_enabled(self.outgoing.is_none() && self.sessions.len() < MAX_SESSIONS,
+                            if !device.compatible() { ui.colored_label(Color32::LIGHT_RED, "Update required on this computer and the other computer (0.2.0+)"); }
+                            if ui.add_enabled(self.outgoing.is_none(),
                                 egui::Button::new(format!("Connect to {}", device.name))).clicked() {
-                                self.outgoing = Some(Outgoing::start(device));
-                                self.release(); self.events.clear();
+                                self.connect_device(device);
                             }
                         }
-                        if ui.button("Disable discovery and incoming requests").clicked() { self.discovery.take(); }
+                        if ui.button("Disable local access / disconnect incoming viewer").clicked() { self.discovery.take(); }
                         ctx.request_repaint_after(Duration::from_millis(100));
-                    } else if ui.button("Enable automatic discovery").clicked() { self.enable_discovery(); }
+                    } else if ui.button("Enable local access and discovery").clicked() { self.enable_discovery(); }
                     if let Some(outgoing) = &mut self.outgoing {
-                        let mut state = outgoing.state.lock().unwrap();
+                        let state = outgoing.state.lock().unwrap();
                         ui.label(format!("Connecting to {}", outgoing.device.name));
                         ui.label(&state.status);
-                        if state.waiting_code {
-                            ui.add(egui::TextEdit::singleline(&mut outgoing.code).char_limit(6).hint_text("Six-digit code").password(true));
-                            if ui.add_enabled(outgoing.code.len() == 6 && outgoing.code.bytes().all(|b| b.is_ascii_digit()),
-                                egui::Button::new("Verify code")).clicked() {
-                                state.entered_code = Some(std::mem::take(&mut outgoing.code)); state.waiting_code = false;
-                            }
-                        }
                         drop(state);
                         if ui.button("Cancel connection request").clicked() { self.outgoing.take(); }
                     }
                     ui.separator();
-                    if let Some(host) = &self.host {
-                        ui.colored_label(Color32::from_rgb(107, 175, 156), "Sharing is enabled");
-                        ui.label(host.status.lock().unwrap().clone());
-                        if host.has_viewer() {
-                            ui.label("Remote input forwarding is paused while someone is connected to this computer, to prevent control loops.");
-                        }
-                        if ui.button("Copy private pairing code").clicked() { ctx.copy_text(host.pairing.clone()); }
-                        ui.label("Anyone with this code can view and control this computer. Stopping sharing revokes the code.");
-                        if ui.button("Stop sharing this computer").clicked() { self.stop_sharing(); }
-                        ctx.request_repaint_after(Duration::from_millis(250));
-                    } else {
-                        ui.label("Share your primary display to let a paired Mac or Windows computer control it.");
+                    if let Some(discovery) = &self.discovery {
+                        let host = discovery.controller.state.lock().unwrap();
+                        ui.colored_label(Color32::from_rgb(107, 175, 156), if host.sharing { "Sharing automatically" } else { "Ready for incoming connections" });
+                        ui.label(&host.status);
+                        if host.has_viewer { ui.label("Outgoing input is paused while this computer is controlled, to prevent control loops."); }
+                    }
+                    ui.label("Any reachable device on the selected private network can view and control this computer while local access is enabled. Use only on your trusted personal network.");
+                    ui.collapsing("Network and video settings", |ui| {
                         egui::ComboBox::from_label("LAN interface")
                             .selected_text(format!("{} ({})", self.interfaces[self.interface].0, self.interfaces[self.interface].1))
                             .show_ui(ui, |ui| {
@@ -503,35 +488,22 @@ impl eframe::App for Localnet {
                                     ui.selectable_value(&mut self.interface, index, format!("{name} ({ip})"));
                                 }
                             });
-                        ui.collapsing("Video settings", |ui| {
                             ui.add(egui::Slider::new(&mut self.settings.fps, 5..=60).text("Target FPS (cap, not guaranteed)"));
                             ui.add(egui::Slider::new(&mut self.settings.width, 640..=3840).text("Video width"));
                             ui.add(egui::Slider::new(&mut self.settings.quality, 20..=95).text("JPEG quality"));
-                        });
                         if cfg!(target_os = "macos") {
-                            ui.label("Sharing requires Screen Recording and Accessibility permission. Viewing another computer does not.");
+                            ui.label("Mac: enable Screen Recording, Accessibility, and Local Network in System Settings. OS permissions cannot be removed by Localnet.");
+                            if ui.button("Check / request OS permissions").clicked() {
+                                self.error = match crate::capture::request_permissions() { Ok(()) => "OS permissions are available.".into(), Err(e) => format!("{e:#}") };
+                            }
                         } else {
                             ui.label("Allow Localnet through Windows Firewall on Private networks when sharing.");
                         }
-                        if ui.button("Share this computer").clicked() {
-                            match Host::start(self.interfaces[self.interface].1, self.settings) {
-                                Ok(host) => { self.host = Some(host); self.error.clear(); }
-                                Err(e) => self.error = format!("{e:#}"),
-                            }
-                        }
-                    }
+                        if let Some(discovery) = &self.discovery { *discovery.controller.settings.lock().unwrap() = self.settings; }
+                        if ui.button("Apply interface / restart local access").clicked() { self.discovery.take(); self.enable_discovery(); }
+                    });
                     ui.add_space(16.0);
                     ui.separator();
-                    ui.collapsing("Manual pairing (advanced)", |ui| {
-                    ui.label("On the other Mac or Windows PC, click Share this computer, then transfer its pairing code privately.");
-                    ui.add(egui::TextEdit::singleline(&mut self.computer_name).char_limit(60)
-                        .hint_text("Computer name (optional)").desired_width(f32::INFINITY));
-                    ui.add(egui::TextEdit::multiline(&mut self.pairing).char_limit(crate::protocol::MAX_JSON)
-                        .desired_rows(3).desired_width(f32::INFINITY).hint_text("Private pairing code: ln1:...").password(true));
-                    if ui.add_enabled(self.sessions.len() < MAX_SESSIONS, egui::Button::new("Connect")).clicked() {
-                        match self.connect(&ctx) { Ok(()) => self.error.clear(), Err(e) => self.error = format!("{e:#}") }
-                    }
-                    });
                     ui.label(format!("{} / {MAX_SESSIONS} remote sessions. Sharing and viewing work independently.", self.sessions.len()));
                     if !self.error.is_empty() { ui.colored_label(Color32::from_rgb(245, 140, 130), &self.error); }
                     ui.add_space(16.0);
@@ -545,8 +517,8 @@ impl eframe::App for Localnet {
                 ui.heading("One app. Either direction.");
                 ui.label("Control Windows from your Mac, or your Mac from Windows.");
                 ui.add_space(16.0);
-                ui.label("Click a nearby computer, enter the code displayed there, then approve access there. Sharing starts automatically after approval.");
-                ui.label("You can also share this computer while viewing others. Sharing is always opt-in.");
+                ui.label("Open Localnet on both computers. Click a nearby computer to see and control it. No codes or approval dialogs.");
+                ui.label("Disconnect when finished; sharing ends automatically and you can reconnect from the same list.");
                 return;
             }
             let mut selected = None;
@@ -593,34 +565,6 @@ impl eframe::App for Localnet {
                 if session.viewer.connected() { self.remote_rect = Some(rect); }
             }
         });
-        let pending = self
-            .discovery
-            .as_ref()
-            .and_then(|d| d.state.lock().unwrap().pending.clone());
-        if let Some(pending) = pending {
-            if self.controlling {
-                self.release();
-            }
-            self.events.clear();
-            let mut pending = pending.lock().unwrap();
-            egui::Window::new("Connection request").collapsible(false).resizable(false).show(&ctx, |ui| {
-                ui.label(format!("{} ({}) requests screen viewing and keyboard/mouse control.", pending.name, pending.peer));
-                ui.label("The computer name is not verified. Only allow a request you initiated.");
-                ui.heading(format!("Pairing code: {}", pending.code));
-                ui.label("Enter this code on the computer you are connecting from. Never give it to an unexpected caller.");
-                if pending.verified { ui.label("Code verified. You can approve this connection."); }
-                if ui.add_enabled(pending.ready() && self.host.is_none(), egui::Button::new("Allow viewing and control")).clicked() {
-                    match Host::start_approved(self.discovery.as_ref().unwrap().ip, self.settings) {
-                        Ok(host) => {
-                            let decision = Pairing::decode(&host.pairing).map_err(|e| e.to_string());
-                            if pending.ready() { pending.decision = Some(decision); self.host = Some(host); }
-                        }
-                        Err(e) => { self.error = format!("{e:#}"); pending.decision = Some(Err(self.error.clone())); }
-                    }
-                }
-                if ui.button("Deny request").clicked() { pending.cancel(); }
-            });
-        }
         self.route_input();
         if ctx.input(|i| i.viewport().close_requested()) {
             self.shutdown();
@@ -709,78 +653,50 @@ mod tests {
     }
 
     #[test]
-    fn failed_pairing_preserves_existing_sessions() {
+    fn old_devices_preserve_existing_sessions_and_show_update_error() {
         let mut app = app_with_sessions();
         app.controlling = true;
-        app.pairing = "not a code".into();
-        assert!(app.connect(&egui::Context::default()).is_err());
+        app.connect_device(Device {
+            name: "Old Mac".into(),
+            address: "127.0.0.1:45778".parse().unwrap(),
+            certificate: vec![1],
+            version: 1,
+        });
         assert_eq!(app.active, Some(0));
         assert!(app.controlling);
-        let pair = Pairing {
-            version: crate::protocol::VERSION,
-            address: app.sessions[0].address,
-            certificate: vec![1],
-            token: "a".repeat(64),
-        };
-        app.pairing = pair.encode().unwrap();
-        assert!(app.connect(&egui::Context::default()).is_err());
+        assert!(app.error.contains("Update Localnet"));
         assert_eq!(app.sessions.len(), 2);
         app.shutdown();
-        assert!(app.sessions.is_empty() && app.active.is_none() && app.host.is_none());
+        assert!(app.sessions.is_empty() && app.active.is_none() && app.discovery.is_none());
     }
 
     #[test]
-    #[ignore = "Requires an unlocked interactive desktop; loopback capture only, no input injection"]
-    fn sharing_and_viewing_have_independent_lifetimes() {
+    fn clicking_connected_computer_selects_it_without_starting_another_connection() {
         let mut app = app_with_sessions();
-        app.host = Some(
-            Host::start(
-                "127.0.0.1".parse().unwrap(),
-                VideoSettings {
-                    fps: 10,
-                    width: 640,
-                    quality: 50,
-                },
-            )
-            .unwrap(),
-        );
-        app.disconnect_active();
-        assert!(app.host.is_some());
-        app.stop_sharing();
-        assert!(app.sessions[0].viewer.connected());
-        let ctx = egui::Context::default();
-        app.host = Some(
-            Host::start(
-                "127.0.0.1".parse().unwrap(),
-                VideoSettings {
-                    fps: 10,
-                    width: 640,
-                    quality: 50,
-                },
-            )
-            .unwrap(),
-        );
-        app.pairing = app.host.as_ref().unwrap().pairing.clone();
-        app.connect(&ctx).unwrap();
-        let until = std::time::Instant::now() + Duration::from_secs(10);
-        while app.sessions[1].viewer.state.lock().unwrap().frames < 2
-            && std::time::Instant::now() < until
-        {
-            assert!(
-                app.sessions[1].viewer.connected(),
-                "{}",
-                app.sessions[1].viewer.state.lock().unwrap().status
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(app.sessions[1].viewer.state.lock().unwrap().frames >= 2);
-        // Do not forward input received from another controller into a second computer.
-        app.controlling = true;
-        app.events.push(Event::Text("must not forward".into()));
-        app.route_input();
+        app.active = Some(1);
+        app.connect_device(Device {
+            name: "Existing PC".into(),
+            address: "127.0.0.1:45778".parse().unwrap(),
+            certificate: vec![1],
+            version: crate::protocol::VERSION,
+        });
+        assert_eq!(app.active, Some(0));
+        assert!(app.outgoing.is_none());
+        assert_eq!(app.sessions.len(), 2);
+    }
+
+    #[test]
+    fn disconnected_computer_is_replaced_without_leaving_duplicate_tab() {
+        let mut app = app_with_sessions();
+        app.sessions[0].viewer.stop();
+        app.connect_device(Device {
+            name: "Reconnect".into(),
+            address: "127.0.0.1:1".parse().unwrap(),
+            certificate: vec![1],
+            version: crate::protocol::VERSION,
+        });
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app.outgoing.is_some());
         assert!(!app.controlling);
-        app.disconnect_active();
-        assert!(app.host.is_some() && app.sessions[0].viewer.connected());
-        app.shutdown();
     }
 }

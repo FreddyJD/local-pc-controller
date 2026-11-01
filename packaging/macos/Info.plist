@@ -7,11 +7,12 @@
     <key>CFBundleIdentifier</key><string>dev.localnet.desktop</string>
     <key>CFBundleExecutable</key><string>localnet</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>0.2.0</string>
+    <key>CFBundleVersion</key><string>2</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>Connect directly to your paired computers on your private local network for screen sharing and remote input.</string>
+    <string>Discover and automatically control computers running Localnet on your trusted private network.</string>
+    <key>NSBonjourServices</key><array><string>_localnet._tcp</string></array>
 </dict>
 </plist>

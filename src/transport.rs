@@ -1,4 +1,4 @@
-use crate::protocol::{Pairing, SERVER_NAME};
+use crate::protocol::{SERVER_NAME, SessionTicket};
 use anyhow::Result;
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
@@ -85,7 +85,7 @@ impl Lifetime {
     }
 }
 
-pub fn client_config(pair: &Pairing) -> Result<Arc<ClientConfig>> {
+pub fn client_config(pair: &SessionTicket) -> Result<Arc<ClientConfig>> {
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(pair.certificate.clone()))?;
     Ok(Arc::new(
@@ -96,7 +96,11 @@ pub fn client_config(pair: &Pairing) -> Result<Arc<ClientConfig>> {
     ))
 }
 
-pub fn connect(pair: &Pairing, config: Arc<ClientConfig>, life: &Lifetime) -> Result<ClientStream> {
+pub fn connect(
+    pair: &SessionTicket,
+    config: Arc<ClientConfig>,
+    life: &Lifetime,
+) -> Result<ClientStream> {
     let socket = TcpStream::connect_timeout(&pair.address, IO_TIMEOUT)?;
     life.track(&socket)?;
     let mut stream = StreamOwned::new(
@@ -137,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_verifies_paired_certificate_and_rejects_another_host() {
+    fn tls_verifies_discovered_certificate_and_rejects_another_host() {
         use crate::protocol::{VERSION, read_json, write_json};
         use rustls::pki_types::PrivatePkcs8KeyDer;
         for trust_correct_cert in [true, false] {
@@ -158,7 +162,7 @@ mod tests {
             );
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
-            let pair = Pairing {
+            let pair = SessionTicket {
                 version: VERSION,
                 address: listener.local_addr().unwrap(),
                 token: "a".repeat(64),

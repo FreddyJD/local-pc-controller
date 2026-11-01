@@ -1,29 +1,27 @@
 use crate::{
-    protocol::{self, Pairing, is_local},
+    host::{HostController, VideoSettings},
+    protocol::{self, RemoteError, SessionTicket, is_local},
     transport::{self, Lifetime},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use hmac::{Hmac, Mac};
 use mdns_sd::{IfKind, IfPredicate, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, TryRecvError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 const SERVICE: &str = "_localnet._tcp.local.";
-const HUMAN_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_DEVICES: usize = 64;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn computer_name() -> String {
     let name = std::env::var("COMPUTERNAME")
@@ -54,44 +52,24 @@ pub struct Device {
     pub name: String,
     pub address: SocketAddr,
     pub certificate: Vec<u8>,
+    pub version: u16,
 }
 
-pub struct Pending {
-    pub name: String,
-    pub peer: IpAddr,
-    pub code: String,
-    pub verified: bool,
-    pub expires: Instant,
-    pub decision: Option<Result<Pairing, String>>,
-    canceled: bool,
-    life: Arc<Lifetime>,
-}
-
-impl Pending {
-    pub fn cancel(&mut self) {
-        self.canceled = true;
-        self.life.stop();
-    }
-    pub fn ready(&self) -> bool {
-        self.verified
-            && !self.canceled
-            && !self.life.stopped()
-            && Instant::now() < self.expires
-            && self.decision.is_none()
+impl Device {
+    pub fn compatible(&self) -> bool {
+        self.version == protocol::VERSION
     }
 }
 
 #[derive(Default)]
 pub struct DiscoveryState {
     pub devices: HashMap<String, Device>,
-    pub pending: Option<Arc<Mutex<Pending>>>,
     pub status: String,
 }
 
 pub struct Discovery {
-    pub ip: IpAddr,
     pub state: Arc<Mutex<DiscoveryState>>,
-    pub accepting: Arc<AtomicBool>,
+    pub controller: Arc<HostController>,
     life: Arc<Lifetime>,
     daemon: ServiceDaemon,
     fullname: String,
@@ -99,7 +77,10 @@ pub struct Discovery {
 }
 
 fn txt(certificate: &[u8], name: &str) -> HashMap<String, String> {
-    let mut properties = HashMap::from([("v".into(), "1".into()), ("name".into(), name.into())]);
+    let mut properties = HashMap::from([
+        ("v".into(), protocol::VERSION.to_string()),
+        ("name".into(), name.into()),
+    ]);
     let encoded = STANDARD.encode(certificate);
     let chunks: Vec<_> = encoded.as_bytes().chunks(180).collect();
     properties.insert("cert_count".into(), chunks.len().to_string());
@@ -121,7 +102,7 @@ fn device(service: &ResolvedService) -> Result<Device> {
                 .ok_or_else(|| anyhow::anyhow!("Missing discovery property"))?,
         )?)
     };
-    ensure!(property("v")? == "1", "Unsupported discovery version");
+    let version = property("v")?.parse()?;
     let name = property("name")?;
     ensure!(
         !name.is_empty()
@@ -166,31 +147,24 @@ fn device(service: &ResolvedService) -> Result<Device> {
         name: name.into(),
         address: SocketAddr::new(ip, service.get_port()),
         certificate,
+        version,
     })
 }
 
 impl Discovery {
-    pub fn start(ip: IpAddr) -> Result<Self> {
+    pub fn start(ip: IpAddr, settings: VideoSettings) -> Result<Self> {
         ensure!(
             is_local(ip) && !ip.is_loopback(),
             "Discovery needs a private LAN interface"
         );
-        Self::start_inner(ip, true)
+        Self::start_inner(ip, settings, true)
     }
 
-    fn start_inner(ip: IpAddr, advertise: bool) -> Result<Self> {
-        let listener = TcpListener::bind(SocketAddr::new(ip, if advertise { 45778 } else { 0 }))?;
+    fn start_inner(ip: IpAddr, settings: VideoSettings, advertise: bool) -> Result<Self> {
+        let listener = TcpListener::bind(SocketAddr::new(ip, if advertise { 45778 } else { 0 }))
+            .context("Discovery port 45778 (close any other Localnet instance)")?;
         listener.set_nonblocking(true)?;
-        let identity = rcgen::generate_simple_self_signed(vec![protocol::SERVER_NAME.into()])?;
-        let config = Arc::new(
-            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])?
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![identity.cert.der().clone()],
-                    PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
-                )?,
-        );
+        let (config, certificate) = identity()?;
         let daemon = ServiceDaemon::new()?;
         let setup = (|| -> Result<_> {
             let private = IfKind::Predicate(IfPredicate::new(move |i| i.ip() == ip));
@@ -203,7 +177,7 @@ impl Discovery {
                 &format!("localnet-{}.local.", &id[..16]),
                 ip,
                 listener.local_addr()?.port(),
-                txt(identity.cert.der(), &computer_name()),
+                txt(&certificate, &computer_name()),
             )?;
             info.set_interfaces(vec![private]);
             let fullname = info.get_fullname().to_owned();
@@ -220,23 +194,20 @@ impl Discovery {
             }
         };
         let life = Arc::new(Lifetime::default());
-        let accepting = Arc::new(AtomicBool::new(true));
+        let controller = Arc::new(HostController::start(ip, settings));
         let state = Arc::new(Mutex::new(DiscoveryState {
-            status: format!(
-                "Looking for computers on {ip}. Incoming requests require your approval."
-            ),
+            status: format!("Local access enabled on {ip}. Click a computer to connect."),
             ..Default::default()
         }));
         let worker = {
-            let (life, state, own, accepting) = (
+            let (life, state, own, controller) = (
                 life.clone(),
                 state.clone(),
                 fullname.clone(),
-                accepting.clone(),
+                controller.clone(),
             );
             thread::spawn(move || {
                 let mut workers: Vec<(JoinHandle<()>, Arc<Lifetime>)> = Vec::new();
-                let mut last_attempt = Instant::now() - Duration::from_secs(10);
                 while !life.stopped() {
                     for _ in 0..128 {
                         match events.try_recv() {
@@ -258,11 +229,11 @@ impl Discovery {
                             Ok(_) => {}
                             Err(mdns_sd::TryRecvError::Empty) => break,
                             Err(mdns_sd::TryRecvError::Disconnected) => {
-                                let mut state = state.lock().unwrap();
-                                state.devices.clear();
-                                state.status =
-                                    "Discovery stopped. Disable and enable discovery to retry."
+                                state.lock().unwrap().devices.clear();
+                                state.lock().unwrap().status =
+                                    "Discovery stopped. Disable and enable local access to retry."
                                         .into();
+                                life.stop();
                                 break;
                             }
                         }
@@ -276,32 +247,30 @@ impl Discovery {
                         }
                     }
                     match listener.accept() {
-                        Ok((socket, peer))
-                            if is_local(peer.ip())
-                                && workers.len() < 2
-                                && accepting.load(Ordering::Relaxed)
-                                && last_attempt.elapsed() >= Duration::from_secs(5) =>
-                        {
-                            last_attempt = Instant::now();
-                            let (config, state, accepting) =
-                                (config.clone(), state.clone(), accepting.clone());
-                            let worker_life = Arc::new(Lifetime::default());
-                            if worker_life.track(&socket).is_err() {
+                        Ok((socket, peer)) if is_local(peer.ip()) && workers.len() < 4 => {
+                            let (config, state, controller) =
+                                (config.clone(), state.clone(), controller.clone());
+                            let cancel = Arc::new(Lifetime::default());
+                            if cancel.track(&socket).is_err() {
                                 continue;
                             }
-                            let cancel = worker_life.clone();
+                            let worker_cancel = cancel.clone();
                             workers.push((
                                 thread::spawn(move || {
-                                    let _ = incoming(
+                                    let result = incoming(
                                         socket,
                                         peer.ip(),
                                         config,
-                                        &state,
-                                        &cancel,
-                                        &accepting,
+                                        &worker_cancel,
+                                        |peer, life| controller.request(peer, life),
                                     );
+                                    if let Err(e) = result {
+                                        state.lock().unwrap().status =
+                                            format!("Connection from {} ended: {e:#}", peer.ip());
+                                    }
+                                    worker_cancel.stop();
                                 }),
-                                worker_life,
+                                cancel,
                             ));
                         }
                         Ok(_) => {}
@@ -311,7 +280,7 @@ impl Discovery {
                             break;
                         }
                     }
-                    thread::sleep(Duration::from_millis(20));
+                    thread::sleep(Duration::from_millis(10));
                 }
                 for (_, cancel) in &workers {
                     cancel.stop();
@@ -322,9 +291,8 @@ impl Discovery {
             })
         };
         Ok(Self {
-            ip,
             state,
-            accepting,
+            controller,
             life,
             daemon,
             fullname,
@@ -336,9 +304,6 @@ impl Discovery {
 impl Drop for Discovery {
     fn drop(&mut self) {
         self.life.stop();
-        if let Some(pending) = self.state.lock().unwrap().pending.as_ref() {
-            pending.lock().unwrap().cancel();
-        }
         let _ = self.daemon.unregister(&self.fullname);
         let _ = self.daemon.stop_browse(SERVICE);
         let _ = self.daemon.shutdown();
@@ -348,150 +313,108 @@ impl Drop for Discovery {
     }
 }
 
+fn identity() -> Result<(Arc<ServerConfig>, Vec<u8>)> {
+    let identity = rcgen::generate_simple_self_signed(vec![protocol::SERVER_NAME.into()])?;
+    let config = Arc::new(
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![identity.cert.der().clone()],
+                PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
+            )?,
+    );
+    Ok((config, identity.cert.der().to_vec()))
+}
+
 #[derive(Serialize, Deserialize)]
 struct Request {
     version: u16,
     name: String,
 }
 
-fn confirmation(key: &[u8], binding: &[u8], role: &[u8]) -> Vec<u8> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
-    mac.update(b"localnet-pair-v1");
-    mac.update(binding);
-    mac.update(role);
-    mac.finalize().into_bytes().to_vec()
+#[derive(Serialize, Deserialize)]
+enum Reply {
+    Starting,
+    Ready(SessionTicket),
+    Error(RemoteError),
 }
 
-fn verify(key: &[u8], binding: &[u8], role: &[u8], proof: &[u8]) -> Result<()> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)?;
-    mac.update(b"localnet-pair-v1");
-    mac.update(binding);
-    mac.update(role);
-    mac.verify_slice(proof)
-        .map_err(|_| anyhow::anyhow!("Pairing code or TLS channel did not match"))
-}
-
-fn password() -> Result<String> {
-    // Rejection sampling avoids modulo bias in the short, single-attempt pairing code.
-    loop {
-        let mut raw = [0; 4];
-        getrandom::fill(&mut raw).map_err(|e| anyhow::anyhow!("Random source failed: {e}"))?;
-        let value = u32::from_le_bytes(raw);
-        if value < 4_294_000_000 {
-            return Ok(format!("{:06}", value % 1_000_000));
-        }
-    }
-}
+type LaunchResult = std::result::Result<SessionTicket, RemoteError>;
 
 fn incoming(
     socket: TcpStream,
     peer: IpAddr,
     config: Arc<ServerConfig>,
-    state: &Arc<Mutex<DiscoveryState>>,
     life: &Arc<Lifetime>,
-    accepting: &AtomicBool,
+    launch: impl FnOnce(
+        IpAddr,
+        Arc<Lifetime>,
+    ) -> std::result::Result<Receiver<LaunchResult>, RemoteError>,
 ) -> Result<()> {
-    let mut stream = transport::accept(socket, config)?;
-    let binding =
-        stream
-            .conn
-            .export_keying_material([0u8; 32], b"EXPORTER-Channel-Binding", Some(b""))?;
+    let mut stream = transport::accept(socket, config).context("Discovery TLS handshake")?;
     stream.sock.renew();
-    let request: Request = protocol::read_json(&mut stream)?;
-    ensure!(
-        request.version == 1
-            && !request.name.is_empty()
-            && request.name.len() <= 240
-            && !request.name.chars().any(|c| c.is_control()
-                || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')),
-        "Invalid request"
-    );
-    let pending = Arc::new(Mutex::new(Pending {
-        name: request.name,
-        peer,
-        code: password()?,
-        verified: false,
-        expires: Instant::now() + HUMAN_TIMEOUT,
-        decision: None,
-        canceled: false,
-        life: life.clone(),
-    }));
-    {
-        let mut state = state.lock().unwrap();
-        ensure!(
-            state.pending.is_none() && accepting.load(Ordering::Relaxed),
-            "Computer is busy"
-        );
-        state.pending = Some(pending.clone());
-    }
+    let request: Request = protocol::read_json(&mut stream).context("Connection request")?;
     let result = (|| -> Result<()> {
-        protocol::write_json(&mut stream, &true)?;
-        let remote = loop {
-            ensure!(
-                !life.stopped() && pending.lock().unwrap().expires > Instant::now(),
-                "Request expired or canceled"
-            );
-            stream.sock.renew();
-            let remote: Option<Vec<u8>> = protocol::read_json(&mut stream)?;
-            if let Some(remote) = remote {
-                break remote;
-            }
-            protocol::write_json(&mut stream, &true)?;
-        };
-        ensure!(remote.len() == 33, "Invalid pairing exchange");
-        let code = pending.lock().unwrap().code.clone();
-        let (pake, outbound) = Spake2::<Ed25519Group>::start_b(
-            &Password::new(code.as_bytes()),
-            &Identity::new(b"localnet-viewer-v1"),
-            &Identity::new(b"localnet-host-v1"),
+        ensure!(
+            request.version == protocol::VERSION,
+            "Update Localnet on both computers (connection protocol mismatch)"
         );
-        let key = pake
-            .finish(&remote)
-            .map_err(|e| anyhow::anyhow!("Pairing exchange failed: {e:?}"))?;
-        protocol::write_json(&mut stream, &outbound)?;
-        stream.sock.renew();
-        let proof: Vec<u8> = protocol::read_json(&mut stream)?;
-        verify(&key, &binding, b"viewer", &proof)?;
-        protocol::write_json(&mut stream, &confirmation(&key, &binding, b"host"))?;
-        pending.lock().unwrap().verified = true;
-        loop {
-            ensure!(!life.stopped(), "Request canceled");
-            stream.sock.renew();
-            ensure!(
-                protocol::read_json::<bool>(&mut stream)?,
-                "Invalid approval heartbeat"
-            );
-            let mut pending = pending.lock().unwrap();
-            ensure!(
-                !pending.canceled && Instant::now() < pending.expires,
-                "Request expired or canceled"
-            );
-            let decision = pending.decision.take();
-            if decision.is_some() {
-                drop(pending);
-                protocol::write_json(&mut stream, &decision)?;
-                return Ok(());
-            }
-            ensure!(accepting.load(Ordering::Relaxed), "Computer is busy");
-            drop(pending);
-            protocol::write_json(&mut stream, &None::<Result<Pairing, String>>)?;
-        }
+        ensure!(
+            is_local(peer)
+                && !request.name.is_empty()
+                && request.name.len() <= 240
+                && !request.name.chars().any(char::is_control),
+            "Invalid local connection request"
+        );
+        Ok(())
     })();
-    pending.lock().unwrap().canceled = true;
-    let mut state = state.lock().unwrap();
-    if state
-        .pending
-        .as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, &pending))
-    {
-        state.pending = None;
+    if let Err(e) = result {
+        protocol::write_json(
+            &mut stream,
+            &Reply::Error(RemoteError::new("incompatible_request", e.to_string())),
+        )?;
+        return Ok(());
     }
-    result
+    let receiver = match launch(peer, life.clone()) {
+        Ok(receiver) => receiver,
+        Err(e) => {
+            protocol::write_json(&mut stream, &Reply::Error(e))?;
+            return Ok(());
+        }
+    };
+    let expires = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        stream.sock.renew();
+        let reply = match receiver.try_recv() {
+            Ok(Ok(ticket)) => Reply::Ready(ticket),
+            Ok(Err(e)) => Reply::Error(e),
+            Err(TryRecvError::Empty) if Instant::now() < expires && !life.stopped() => {
+                Reply::Starting
+            }
+            Err(TryRecvError::Empty) => Reply::Error(RemoteError::new(
+                "startup_timeout",
+                "Remote screen sharing did not start within 60 seconds. Check its Localnet status and OS permissions.",
+            )),
+            Err(TryRecvError::Disconnected) => Reply::Error(RemoteError::new(
+                "startup_failed",
+                "Remote sharing worker stopped during startup",
+            )),
+        };
+        let terminal = !matches!(reply, Reply::Starting);
+        protocol::write_json(&mut stream, &reply)?;
+        if terminal {
+            return Ok(());
+        }
+        ensure!(
+            protocol::read_json::<bool>(&mut stream)?,
+            "Connection canceled"
+        );
+    }
 }
 
 pub struct Outgoing {
     pub device: Device,
-    pub code: String,
     pub state: Arc<Mutex<OutgoingState>>,
     life: Arc<Lifetime>,
     worker: Option<JoinHandle<()>>,
@@ -500,29 +423,27 @@ pub struct Outgoing {
 #[derive(Default)]
 pub struct OutgoingState {
     pub status: String,
-    pub waiting_code: bool,
-    pub entered_code: Option<String>,
-    pub result: Option<Result<Pairing, String>>,
+    pub result: Option<Result<SessionTicket, String>>,
 }
 
 impl Outgoing {
     pub fn start(device: Device) -> Self {
         let state = Arc::new(Mutex::new(OutgoingState {
-            status: "Requesting access...".into(),
+            status: "Connecting to local computer...".into(),
             ..Default::default()
         }));
         let life = Arc::new(Lifetime::default());
         let worker = {
             let (state, life, device) = (state.clone(), life.clone(), device.clone());
             thread::spawn(move || {
-                let result = outgoing(&device, &state, &life).map_err(|e| e.to_string());
+                let result = outgoing(&device, &state, &life)
+                    .map_err(|e| format!("{} ({}): {e:#}", device.name, device.address.ip()));
                 state.lock().unwrap().result = Some(result);
                 life.stop();
             })
         };
         Self {
             device,
-            code: String::new(),
             state,
             life,
             worker: Some(worker),
@@ -543,107 +464,61 @@ fn outgoing(
     device: &Device,
     state: &Arc<Mutex<OutgoingState>>,
     life: &Lifetime,
-) -> Result<Pairing> {
-    let provisional = Pairing {
+) -> Result<SessionTicket> {
+    ensure!(
+        device.compatible(),
+        "Update Localnet on this computer and {} to 0.2.0 or newer; the old pairing build cannot connect without codes.",
+        device.name
+    );
+    let provisional = SessionTicket {
         version: protocol::VERSION,
         address: device.address,
         certificate: device.certificate.clone(),
         token: String::new(),
     };
-    let mut stream =
-        transport::connect(&provisional, transport::client_config(&provisional)?, life)?;
-    let binding =
-        stream
-            .conn
-            .export_keying_material([0u8; 32], b"EXPORTER-Channel-Binding", Some(b""))?;
+    let mut stream = transport::connect(&provisional, transport::client_config(&provisional)?, life)
+        .context("Connecting to discovery TLS on port 45778; check the remote app, firewall, and that both computers use the same build")?;
     stream.sock.renew();
     protocol::write_json(
         &mut stream,
         &Request {
-            version: 1,
+            version: protocol::VERSION,
             name: computer_name(),
         },
     )?;
-    ensure!(
-        protocol::read_json::<bool>(&mut stream)?,
-        "Host rejected request"
-    );
-    {
-        let mut state = state.lock().unwrap();
-        state.waiting_code = true;
-        state.status = "Enter the six-digit code shown on the other computer.".into();
-    }
-    let expires = Instant::now() + HUMAN_TIMEOUT;
-    let code = loop {
+    let expires = Instant::now() + STARTUP_TIMEOUT;
+    loop {
         ensure!(
             !life.stopped() && Instant::now() < expires,
-            "Request expired or canceled"
+            "Connection canceled or startup timed out"
         );
-        if let Some(code) = state.lock().unwrap().entered_code.take() {
-            break code;
-        }
         stream.sock.renew();
-        protocol::write_json(&mut stream, &None::<Vec<u8>>)?;
-        ensure!(
-            protocol::read_json::<bool>(&mut stream)?,
-            "Request rejected"
-        );
-        thread::sleep(Duration::from_millis(250));
-    };
-    ensure!(
-        code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()),
-        "Expected six digits"
-    );
-    let (pake, message) = Spake2::<Ed25519Group>::start_a(
-        &Password::new(code.as_bytes()),
-        &Identity::new(b"localnet-viewer-v1"),
-        &Identity::new(b"localnet-host-v1"),
-    );
-    stream.sock.renew();
-    protocol::write_json(&mut stream, &Some(message))?;
-    let remote: Vec<u8> = protocol::read_json(&mut stream)?;
-    ensure!(remote.len() == 33, "Invalid pairing exchange");
-    let key = pake
-        .finish(&remote)
-        .map_err(|e| anyhow::anyhow!("Pairing exchange failed: {e:?}"))?;
-    protocol::write_json(&mut stream, &confirmation(&key, &binding, b"viewer"))?;
-    let proof: Vec<u8> = protocol::read_json(&mut stream)?;
-    verify(&key, &binding, b"host", &proof)?;
-    {
-        let mut state = state.lock().unwrap();
-        state.waiting_code = false;
-        state.status = "Code verified. Waiting for Allow on the other computer...".into();
+        match protocol::read_json::<Reply>(&mut stream).context("Remote computer closed during automatic sharing startup; check its Localnet status and update both installations")? {
+            Reply::Starting => {
+                state.lock().unwrap().status = "Starting the other computer's screen sharing automatically...".into();
+                thread::sleep(Duration::from_millis(100));
+                protocol::write_json(&mut stream, &true)?;
+            }
+            Reply::Error(e) => anyhow::bail!("Remote {e}"),
+            Reply::Ready(ticket) => {
+                ticket.validate()?;
+                ensure!(ticket.address.ip() == device.address.ip(), "Remote host address changed during startup");
+                return Ok(ticket);
+            }
+        }
     }
-    let decision = loop {
-        ensure!(
-            !life.stopped() && Instant::now() < expires,
-            "Approval expired or canceled"
-        );
-        stream.sock.renew();
-        protocol::write_json(&mut stream, &true)?;
-        let decision: Option<Result<Pairing, String>> = protocol::read_json(&mut stream)?;
-        if let Some(decision) = decision {
-            break decision;
-        }
-        thread::sleep(Duration::from_millis(250));
-    };
-    let pair = decision.map_err(anyhow::Error::msg)?;
-    ensure!(
-        pair.address.ip() == device.address.ip(),
-        "Approved host address changed"
-    );
-    Pairing::decode(&pair.encode()?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn discovery_is_public_only_and_rejects_malformed_records() {
-        let identity =
-            rcgen::generate_simple_self_signed(vec![protocol::SERVER_NAME.into()]).unwrap();
-        let properties = txt(identity.cert.der(), "Office PC");
+    fn discovery_handles_old_versions_and_rejects_malformed_records() {
+        let (_, certificate) = identity().unwrap();
+        let mut properties = txt(&certificate, "Office PC");
         assert!(!properties.contains_key("token") && !properties.contains_key("code"));
+        properties.insert("v".into(), "1".into());
         let service = ServiceInfo::new(
             SERVICE,
             "test",
@@ -653,10 +528,9 @@ mod tests {
             properties.clone(),
         )
         .unwrap();
-        assert_eq!(
-            device(&service.as_resolved_service()).unwrap().name,
-            "Office PC"
-        );
+        let found = device(&service.as_resolved_service()).unwrap();
+        assert_eq!(found.name, "Office PC");
+        assert!(!found.compatible());
         let service = ServiceInfo::new(
             SERVICE,
             "test",
@@ -667,7 +541,6 @@ mod tests {
         )
         .unwrap();
         assert!(device(&service.as_resolved_service()).is_err());
-        let mut properties = properties;
         properties.insert("cert_count".into(), "999".into());
         let service = ServiceInfo::new(
             SERVICE,
@@ -680,73 +553,26 @@ mod tests {
         .unwrap();
         assert!(device(&service.as_resolved_service()).is_err());
     }
-    #[test]
-    fn password_authentication_and_channel_binding() {
-        let (a, ma) = Spake2::<Ed25519Group>::start_a(
-            &Password::new(b"123456"),
-            &Identity::new(b"a"),
-            &Identity::new(b"b"),
-        );
-        let (b, mb) = Spake2::<Ed25519Group>::start_b(
-            &Password::new(b"123456"),
-            &Identity::new(b"a"),
-            &Identity::new(b"b"),
-        );
-        let ka = a.finish(&mb).unwrap();
-        let kb = b.finish(&ma).unwrap();
-        let proof = confirmation(&ka, b"tls connection A", b"viewer");
-        assert!(verify(&kb, b"tls connection A", b"viewer", &proof).is_ok());
-        assert!(verify(&kb, b"tls connection B", b"viewer", &proof).is_err());
-        assert!(verify(&kb, b"tls connection A", b"host", &proof).is_err());
-        let (a, ma) = Spake2::<Ed25519Group>::start_a(
-            &Password::new(b"123456"),
-            &Identity::new(b"a"),
-            &Identity::new(b"b"),
-        );
-        let (b, mb) = Spake2::<Ed25519Group>::start_b(
-            &Password::new(b"123457"),
-            &Identity::new(b"a"),
-            &Identity::new(b"b"),
-        );
-        let ka = a.finish(&mb).unwrap();
-        let kb = b.finish(&ma).unwrap();
-        assert!(
-            verify(
-                &kb,
-                b"tls",
-                b"viewer",
-                &confirmation(&ka, b"tls", b"viewer")
-            )
-            .is_err()
-        );
-    }
 
     #[test]
-    fn consent_requires_code_and_approval_and_handles_denial_cancel() {
-        for mode in ["allow", "wrong code", "deny", "cancel", "expire"] {
-            let identity =
-                rcgen::generate_simple_self_signed(vec![protocol::SERVER_NAME.into()]).unwrap();
-            let config = Arc::new(
-                ServerConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                ))
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .unwrap()
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![identity.cert.der().clone()],
-                    PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
-                )
-                .unwrap(),
-            );
+    fn one_click_returns_ticket_or_actionable_startup_error_without_prompts() {
+        for error in [
+            None,
+            Some(RemoteError::new(
+                "host_start_failed",
+                "Enable Screen Recording and Accessibility on Mac",
+            )),
+            Some(RemoteError::new("busy", "Another viewer is connected")),
+        ] {
+            let (config, certificate) = identity().unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let device = Device {
-                name: "Test host".into(),
+                name: "Test Mac".into(),
                 address: listener.local_addr().unwrap(),
-                certificate: identity.cert.der().to_vec(),
+                certificate,
+                version: protocol::VERSION,
             };
-            let state = Arc::new(Mutex::new(DiscoveryState::default()));
-            let server_state = state.clone();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let server = thread::spawn(move || {
                 let socket = listener.accept().unwrap().0;
                 let life = Arc::new(Lifetime::default());
@@ -755,75 +581,168 @@ mod tests {
                     socket,
                     "127.0.0.1".parse().unwrap(),
                     config,
-                    &server_state,
                     &life,
-                    &AtomicBool::new(true),
+                    |_, _| Ok(receiver),
                 )
+                .unwrap();
             });
             let outgoing = Outgoing::start(device);
+            let response = match &error {
+                Some(e) => Err(e.clone()),
+                None => Ok(SessionTicket {
+                    version: protocol::VERSION,
+                    address: "127.0.0.1:45777".parse().unwrap(),
+                    certificate: vec![1],
+                    token: "a".repeat(64),
+                }),
+            };
+            // Deliberately exceed a normal packet deadline: startup polling must keep the connection alive.
+            thread::sleep(Duration::from_millis(3200));
+            assert!(sender.send(response).is_ok());
             let until = Instant::now() + Duration::from_secs(5);
-            let pending = loop {
-                if let Some(pending) = state.lock().unwrap().pending.clone() {
-                    break pending;
+            let result = loop {
+                if let Some(result) = outgoing.state.lock().unwrap().result.take() {
+                    break result;
                 }
                 assert!(Instant::now() < until);
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(Duration::from_millis(10));
             };
-            assert!(!pending.lock().unwrap().ready());
-            if mode == "cancel" {
-                pending.lock().unwrap().cancel();
-            } else {
-                let code = pending.lock().unwrap().code.clone();
-                let entered = if mode == "wrong code" {
-                    format!("{:06}", (code.parse::<u32>().unwrap() + 1) % 1_000_000)
-                } else {
-                    code
-                };
-                outgoing.state.lock().unwrap().entered_code = Some(entered);
-                if mode != "wrong code" {
-                    while !pending.lock().unwrap().verified {
-                        assert!(Instant::now() < until);
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    assert!(
-                        outgoing.state.lock().unwrap().result.is_none(),
-                        "Code alone must not grant access"
-                    );
-                    assert!(pending.lock().unwrap().ready());
-                    if mode == "expire" {
-                        pending.lock().unwrap().expires = Instant::now();
-                    } else if mode == "deny" {
-                        pending.lock().unwrap().decision = Some(Err("Denied by user".into()));
-                    } else {
-                        pending.lock().unwrap().decision = Some(Ok(Pairing {
-                            version: protocol::VERSION,
-                            address: "127.0.0.1:45777".parse().unwrap(),
-                            certificate: vec![1],
-                            token: "a".repeat(64),
-                        }));
-                    }
-                }
+            match error {
+                None => assert!(result.is_ok()),
+                Some(e) => assert!(result.err().unwrap().contains(&e.message)),
             }
-            while outgoing.state.lock().unwrap().result.is_none() {
-                assert!(Instant::now() < until, "{mode} timed out");
-                thread::sleep(Duration::from_millis(5));
-            }
-            assert_eq!(
-                outgoing
-                    .state
-                    .lock()
-                    .unwrap()
-                    .result
-                    .take()
-                    .unwrap()
-                    .is_ok(),
-                mode == "allow"
-            );
-            drop(outgoing);
-            let server_result = server.join().unwrap();
-            assert_eq!(server_result.is_ok(), matches!(mode, "allow" | "deny"));
-            assert!(state.lock().unwrap().pending.is_none());
+            server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn old_device_reports_update_instead_of_attempting_old_pairing_protocol() {
+        let (_, certificate) = identity().unwrap();
+        let device = Device {
+            name: "Old Mac".into(),
+            address: "127.0.0.1:1".parse().unwrap(),
+            certificate,
+            version: 1,
+        };
+        let error = outgoing(
+            &device,
+            &Arc::new(Mutex::new(OutgoingState::default())),
+            &Lifetime::default(),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("Update Localnet"));
+    }
+
+    #[test]
+    fn incompatible_request_gets_explicit_error_and_never_starts_host() {
+        let (config, certificate) = identity().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ticket = SessionTicket {
+            version: protocol::VERSION,
+            address: listener.local_addr().unwrap(),
+            certificate,
+            token: String::new(),
+        };
+        let server = thread::spawn(move || {
+            incoming(
+                listener.accept().unwrap().0,
+                "127.0.0.1".parse().unwrap(),
+                config,
+                &Arc::new(Lifetime::default()),
+                |_, _| {
+                    panic!("An incompatible version must not start capture");
+                },
+            )
+            .unwrap();
+        });
+        let mut stream = transport::connect(
+            &ticket,
+            transport::client_config(&ticket).unwrap(),
+            &Lifetime::default(),
+        )
+        .unwrap();
+        protocol::write_json(
+            &mut stream,
+            &Request {
+                version: 1,
+                name: "Old PC".into(),
+            },
+        )
+        .unwrap();
+        match protocol::read_json::<Reply>(&mut stream).unwrap() {
+            Reply::Error(error) => assert!(error.message.contains("Update Localnet")),
+            _ => panic!("Expected a protocol error"),
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "Full automatic startup and video over loopback on an unlocked desktop; no input injection"]
+    fn one_click_stream_disconnect_reconnect_without_ui_or_codes() {
+        let (config, certificate) = identity().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let device = Device {
+            name: "Loopback PC".into(),
+            address: listener.local_addr().unwrap(),
+            certificate,
+            version: protocol::VERSION,
+        };
+        let controller = Arc::new(HostController::start(
+            "127.0.0.1".parse().unwrap(),
+            VideoSettings {
+                fps: 30,
+                width: 640,
+                quality: 70,
+            },
+        ));
+        let host = controller.clone();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let socket = listener.accept().unwrap().0;
+                let life = Arc::new(Lifetime::default());
+                life.track(&socket).unwrap();
+                incoming(
+                    socket,
+                    "127.0.0.1".parse().unwrap(),
+                    config.clone(),
+                    &life,
+                    |peer, life| host.request(peer, life),
+                )
+                .unwrap();
+                life.stop();
+            }
+        });
+        for _ in 0..2 {
+            let outgoing = Outgoing::start(device.clone());
+            let until = Instant::now() + Duration::from_secs(15);
+            let ticket = loop {
+                if let Some(result) = outgoing.state.lock().unwrap().result.take() {
+                    break result.unwrap();
+                }
+                assert!(Instant::now() < until);
+                thread::sleep(Duration::from_millis(10));
+            };
+            drop(outgoing);
+            let viewer = crate::viewer::Viewer::start(ticket, eframe::egui::Context::default());
+            while viewer.state.lock().unwrap().frames < 3 {
+                assert!(
+                    viewer.connected(),
+                    "{}",
+                    viewer.state.lock().unwrap().status
+                );
+                assert!(Instant::now() < until);
+                thread::sleep(Duration::from_millis(10));
+            }
+            viewer.stop();
+            drop(viewer);
+            while controller.state.lock().unwrap().sharing {
+                assert!(Instant::now() < until);
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        server.join().unwrap();
     }
 
     #[test]
@@ -835,9 +754,8 @@ mod tests {
             .map(|i| i.ip())
             .find(|ip| ip.is_ipv4() && is_local(*ip) && !ip.is_loopback())
             .unwrap();
-        let discovery = Discovery::start_inner(ip, false).unwrap();
-        let identity =
-            rcgen::generate_simple_self_signed(vec![protocol::SERVER_NAME.into()]).unwrap();
+        let discovery = Discovery::start_inner(ip, VideoSettings::default(), false).unwrap();
+        let (_, certificate) = identity().unwrap();
         let id = protocol::random_token().unwrap();
         let mut info = ServiceInfo::new(
             SERVICE,
@@ -845,7 +763,7 @@ mod tests {
             &format!("test-{}.local.", &id[..12]),
             ip,
             45999,
-            txt(identity.cert.der(), "Localnet discovery test"),
+            txt(&certificate, "Localnet discovery test"),
         )
         .unwrap();
         info.set_requires_probe(false);
@@ -856,11 +774,7 @@ mod tests {
             assert!(Instant::now() < until, "mDNS record was not discovered");
             thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(
-            discovery.state.lock().unwrap().devices[&name].name,
-            "Localnet discovery test"
-        );
-        assert!(discovery.state.lock().unwrap().pending.is_none());
+        assert!(discovery.state.lock().unwrap().devices[&name].compatible());
         discovery.daemon.unregister(&name).unwrap();
         let until = Instant::now() + Duration::from_secs(10);
         while discovery.state.lock().unwrap().devices.contains_key(&name) {

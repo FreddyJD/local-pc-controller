@@ -1,9 +1,9 @@
 [package]
 name = "localnet"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
-description = "Paired LAN remote desktop for macOS and Windows"
+description = "One-click private LAN remote desktop for macOS and Windows"
 license = "MIT"
 
 [dependencies]
@@ -12,13 +12,10 @@ base64 = "0.22"
 eframe = { version = "=0.34.3", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 enigo = { version = "=0.6.1", default-features = false }
 getrandom = "0.3"
-hmac = "0.12"
 if-addrs = "0.15"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg"] }
 rcgen = "0.14"
 mdns-sd = "=0.21.6"
-sha2 = "0.10"
-spake2 = "=0.4.0"
 turbojpeg = { version = "=1.5.1", default-features = false, features = ["cmake", "require-simd"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 serde = { version = "1", features = ["derive"] }

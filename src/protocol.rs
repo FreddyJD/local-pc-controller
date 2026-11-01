@@ -1,55 +1,64 @@
 use anyhow::{Result, bail, ensure};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     io::{Read, Write},
     net::{IpAddr, SocketAddr},
 };
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const MAX_JSON: usize = 16 * 1024;
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS: usize = 64;
 pub const SERVER_NAME: &str = "localnet.local";
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemoteError {
+    pub code: String,
+    pub message: String,
+}
+
+impl RemoteError {
+    pub fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Pairing {
+pub struct SessionTicket {
     pub version: u16,
     pub address: SocketAddr,
     pub certificate: Vec<u8>,
     pub token: String,
 }
 
-impl Pairing {
-    pub fn encode(&self) -> Result<String> {
-        Ok(format!(
-            "ln1:{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(self)?)
-        ))
-    }
-
-    pub fn decode(code: &str) -> Result<Self> {
-        ensure!(code.len() <= MAX_JSON, "Pairing code is too long");
-        let raw = URL_SAFE_NO_PAD.decode(
-            code.trim()
-                .strip_prefix("ln1:")
-                .ok_or_else(|| anyhow::anyhow!("Expected a pairing code beginning with ln1:"))?,
-        )?;
-        let pair: Self = serde_json::from_slice(&raw)?;
-        ensure!(pair.version == VERSION, "Unsupported protocol version");
+impl SessionTicket {
+    pub fn validate(&self) -> Result<()> {
         ensure!(
-            is_local(pair.address.ip()) && pair.address.port() != 0,
+            self.version == VERSION,
+            "Update Localnet on both computers (protocol mismatch)"
+        );
+        ensure!(
+            is_local(self.address.ip()) && self.address.port() != 0,
             "Only private LAN or loopback addresses are allowed"
         );
         ensure!(
-            !pair.certificate.is_empty() && pair.certificate.len() <= 4096,
+            !self.certificate.is_empty() && self.certificate.len() <= 4096,
             "Invalid host certificate"
         );
         ensure!(
-            pair.token.len() == 64 && pair.token.bytes().all(|b| b.is_ascii_hexdigit()),
-            "Invalid pairing credential"
+            self.token.len() == 64 && self.token.bytes().all(|b| b.is_ascii_hexdigit()),
+            "Invalid session ticket"
         );
-        Ok(pair)
+        Ok(())
     }
 }
 
@@ -163,6 +172,39 @@ pub fn read_json<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
     Ok(serde_json::from_slice(&read_packet(reader, MAX_JSON)?)?)
 }
 
+pub fn write_frame(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() < MAX_FRAME,
+        "Frame exceeds size limit"
+    );
+    writer.write_all(&((bytes.len() + 1) as u32).to_be_bytes())?;
+    writer.write_all(&[0])?;
+    writer.write_all(bytes)?;
+    writer.flush()?;
+    Ok(())
+}
+
+pub fn write_frame_error(writer: &mut impl Write, error: &str) -> Result<()> {
+    let mut bytes = vec![1];
+    bytes.extend_from_slice(error.as_bytes());
+    write_packet(writer, &bytes, MAX_JSON)
+}
+
+pub fn read_frame(reader: &mut impl Read) -> Result<Vec<u8>> {
+    let mut packet = read_packet(reader, MAX_FRAME)?;
+    match packet.remove(0) {
+        0 => {
+            ensure!(!packet.is_empty(), "Empty frame");
+            Ok(packet)
+        }
+        1 => {
+            ensure!(packet.len() < MAX_JSON, "Invalid error packet");
+            bail!("Remote video: {}", std::str::from_utf8(&packet)?);
+        }
+        _ => bail!("Unknown video packet. Update Localnet on both computers."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,19 +222,35 @@ mod tests {
     }
 
     #[test]
-    fn pairing_rejects_public_routes_and_wrong_versions() {
-        let mut pair = Pairing {
+    fn tickets_reject_public_routes_and_wrong_versions() {
+        let mut pair = SessionTicket {
             version: VERSION,
             address: "192.168.1.10:45777".parse().unwrap(),
             certificate: vec![1],
             token: "a".repeat(64),
         };
-        assert!(Pairing::decode(&pair.encode().unwrap()).is_ok());
+        assert!(pair.validate().is_ok());
         pair.address = "8.8.8.8:45777".parse().unwrap();
-        assert!(Pairing::decode(&pair.encode().unwrap()).is_err());
+        assert!(pair.validate().is_err());
         pair.address = "127.0.0.1:45777".parse().unwrap();
-        pair.version = 2;
-        assert!(Pairing::decode(&pair.encode().unwrap()).is_err());
+        pair.version = 1;
+        assert!(pair.validate().is_err());
+    }
+
+    #[test]
+    fn frames_carry_remote_errors_without_exposing_decoder_to_json() {
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, b"jpeg").unwrap();
+        assert_eq!(read_frame(&mut Cursor::new(bytes)).unwrap(), b"jpeg");
+        let mut bytes = Vec::new();
+        write_frame_error(&mut bytes, "Screen Recording permission required").unwrap();
+        assert!(
+            read_frame(&mut Cursor::new(bytes))
+                .unwrap_err()
+                .to_string()
+                .contains("Screen Recording")
+        );
+        assert!(read_frame(&mut Cursor::new([0, 0, 0, 1, 0])).is_err());
     }
 
     #[test]

@@ -39,15 +39,25 @@ pub fn jpeg(monitor: &Monitor, max_width: u32, quality: u8) -> Result<Vec<u8>> {
 }
 
 pub fn request_permissions() -> Result<()> {
+    permissions(true)
+}
+
+pub fn check_permissions() -> Result<()> {
+    permissions(false)
+}
+
+fn permissions(prompt: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     if !objc2_core_graphics::CGPreflightScreenCaptureAccess() {
-        objc2_core_graphics::CGRequestScreenCaptureAccess();
+        if prompt {
+            objc2_core_graphics::CGRequestScreenCaptureAccess();
+        }
         anyhow::bail!(
             "Enable Localnet in System Settings > Privacy & Security > Screen & System Audio Recording, then restart the app."
         );
     }
     let _ = enigo::Enigo::new(&enigo::Settings {
-        open_prompt_to_get_permissions: true, ..Default::default()
+        open_prompt_to_get_permissions: prompt, ..Default::default()
     }).map_err(|e| anyhow::anyhow!("Input permission: {e}. On Mac, enable Localnet in Privacy & Security > Accessibility, then restart."))?;
     Ok(())
 }

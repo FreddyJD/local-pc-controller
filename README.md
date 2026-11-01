@@ -1,94 +1,88 @@
 # Localnet
 
-One Rust LAN remote desktop app for Windows and macOS. Open it on both computers; click a **Nearby computer**, enter its six-digit on-screen code, then approve **Allow viewing and control** there. Sharing starts automatically after approval. The same app works in either direction: Mac to Windows, Windows to Mac, or between computers using the same OS.
+One Rust app for controlling Windows and macOS computers on your **trusted personal network**. Open Localnet on each computer, click a nearby computer, and control its screen. No accounts, pairing codes, approval dialogs, or cloud services.
 
-## Status
+## Trust Model
 
-This is a functional prototype, not a production remote-desktop product. Windows screen capture, encrypted loopback viewing, rejection of wrong credentials, reconnects, and the desktop UI were tested in the development workspace. Live keyboard/mouse injection and a real two-machine LAN session have not been verified. macOS must be built and tested on a Mac. Do not assume Apple Silicon/Intel, Retina permissions, or input fidelity have been verified until tested on your hardware.
+**Local access is enabled automatically while the app is open. Any reachable private-network peer can request screen viewing and keyboard/mouse control. Installing Localnet is not proof of device ownership.** Use only on a network where you trust every connected device. Do not expose the ports to the Internet, guest networks, shared Wi-Fi, or untrusted VPNs. Private IP ranges do not prove physical LAN membership, and Localnet does not enforce the Windows network profile.
 
-## Run on Windows
+TLS 1.3 encrypts connections and verifies the exact certificate received through discovery, but unauthenticated mDNS can be spoofed. This does **not** authenticate the intended computer against an active attacker. Transient, peer-bound, single-use session tickets coordinate the control/video connections internally; they are not user pairing credentials or an authorization barrier against a LAN peer. Nothing is stored in the clipboard or as a permanent access code.
 
-Requires Rust 1.92+, Visual Studio C++ build tools/Windows SDK, CMake, and NASM when compiling. CMake/NASM build a statically linked native SIMD JPEG encoder; they are not runtime dependencies.
+**Disable local access / disconnect incoming viewer** stops incoming access and discovery without closing outgoing sessions. **Stop all** or closing the app stops both directions. The app does not run at startup or install a background service, firewall rule, or cloud relay.
+
+## Connect
+
+1. Install the same **Localnet 0.2.0** build on Windows and Mac, then open both apps. The old 0.1.0 pairing build is incompatible and appears as **Update required**.
+2. Click **Connect to [computer]** under **Nearby computers**. The target starts sharing automatically, without typing a code or clicking Allow.
+3. Click inside the remote image to send input. Use **Ctrl+Shift+F12**, **Release input**, or click outside the image to release remote input. Focus loss and disconnect also attempt to release held keys/buttons.
+4. Click **Disconnect selected computer** when finished. Sharing ends automatically. Click the computer again to reconnect; a disconnected tab is replaced, and clicking an existing connected computer selects it instead of launching a duplicate session.
+
+Up to four outgoing sessions fit in one window; each target accepts one viewer. If a target is busy, the viewer receives a readable busy error rather than a silent reset. Inactive tabs still consume video bandwidth/CPU. Outgoing input pauses while someone controls this computer to prevent control loops; video continues.
+
+Names and discovery certificates are unverified network data. The computer list is not saved. Discovery uses only the selected private interface. Change interfaces under **Network and video settings**, then **Apply interface / restart local access**. Use **Enable local access and discovery** to resume after stopping it.
+
+Windows Firewall must allow Localnet on **Private** networks. Discovery uses UDP **5353**, automatic connection startup TCP **45778**, and screen/input TCP **45777**. Wi-Fi client isolation, separate VLANs, firewall policies, and macOS Local Network permission can block discovery or connection. The app never changes these policies automatically.
+
+## Windows Build
+
+Requires Rust 1.92+, Visual Studio C++ build tools/Windows SDK, CMake, and NASM. CMake/NASM build a statically linked SIMD JPEG codec and are not runtime requirements.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1
 ```
 
-The packaged executable is `dist/Localnet-Windows.exe`; after compiling, it is also available as `target/release/localnet.exe`. No installer or background service is required. Allow it through Windows Firewall on **Private** networks when sharing this computer. The app does not modify firewall rules.
+The build is `target/release/localnet.exe`. The packaged copy is `dist/Localnet-Windows.exe`, and the local per-user installation is `%LOCALAPPDATA%/Programs/Localnet/Localnet.exe` when installed. Updating the build does not automatically replace an already installed copy.
 
-## Run on Mac
+## Mac Build
 
-Requires Rust 1.92+, Xcode Command Line Tools, and CMake (plus NASM on Intel Macs). Build locally on the Mac (Apple Silicon or Intel). Windows cannot produce the Mac app with the local Windows toolchain.
+Requires Rust 1.92+, Xcode Command Line Tools, and CMake (also NASM on Intel Macs). Build natively on the Mac; the Windows toolchain cannot generate the Mac executable.
 
 ```sh
 sh scripts/bundle-macos.sh
 open dist/Localnet.app
 ```
 
-Install the resulting app in a stable location such as `/Applications/Localnet.app` before granting permissions. To **share the Mac**, enable Localnet under **Screen & System Audio Recording** (or Screen Recording on older macOS) and **Accessibility**, in **System Settings > Privacy & Security**. These two permissions are not needed just to view/control Windows from the Mac. On macOS 15+, allow **Local Network** access if prompted for either direction. Restart Localnet after granting permissions, then retry Share this computer.
+Install the app in a stable location, such as `/Applications/Localnet.app`, before granting permissions. Under **System Settings > Privacy & Security**, enable **Screen & System Audio Recording** (or Screen Recording) and **Accessibility** for Localnet. On macOS 15+, allow **Local Network** too. Use **Network and video settings > Check / request OS permissions** on the Mac for permission prompts, then restart Localnet. These OS permissions cannot be removed or bypassed by disabling application pairing. Viewing another computer does not need Screen Recording/Accessibility on the viewer.
 
-Local builds are ad-hoc signed. Rebuilds can invalidate privacy approvals. For distribution, set `LOCALNET_SIGNING_IDENTITY` to your Developer ID Application identity before bundling, then notarize and staple using your Apple developer account. The script does not notarize, bypass Gatekeeper, or grant privacy permissions. Mac support is intended for macOS 12+, but the deployment target and OS compatibility still need a native Mac build/test.
+Local builds are ad-hoc signed. Rebuilds can invalidate macOS privacy approvals. Set `LOCALNET_SIGNING_IDENTITY` to your Developer ID Application identity for signed distribution; notarization and stapling require your Apple developer account and are not done by the bundle script. Intended minimum macOS is 12, but a native Mac build and runtime testing are still required.
 
-## Connect
+## Connection Errors
 
-1. Open Localnet on both computers. The app automatically advertises public metadata and browses `_localnet._tcp.local.` on its selected private interface. Discovery does not capture your screen or grant input access.
-2. On the computer at your keyboard, click **Connect to [computer]** under **Nearby computers**.
-3. A request appears on the other computer with a random six-digit code. Enter those digits on your computer and click **Verify code**. Then click **Allow viewing and control** on the other computer. Sharing starts automatically; no long pairing string needs copying.
-4. Click inside the remote image to take control. Typing, left/right/middle click, dragging, scrolling, navigation keys, F1-F12, and primary-modifier letter shortcuts are supported.
-5. Use **Ctrl+Shift+F12**, click outside the image, or click **Release input** to release remote control. **Disconnect selected computer** closes only that remote session. Approved sharing automatically ends on disconnect and unclaimed approvals expire after 30 seconds. **Stop sharing this computer** revokes incoming access. **Stop all** or closing the app stops sharing, viewing, discovery, and pending requests. Focus loss, leaving the viewer window, and disconnect also release input.
+The earlier implementation could advertise a computer that was already sharing and then silently drop the discovery connection, producing Windows error **10054**. That is one code-supported cause, not a confirmed diagnosis of a particular Mac session.
 
-Every discovery connection requires a fresh code and approval. Persistent trusted-device enrollment and unattended one-click authorization are **not implemented**. Do not approve unexpected requests or disclose codes to unexpected callers. Names are unverified network data.
+The new version starts sharing off the UI thread, returns explicit permission/startup/busy errors, polls during slow startup instead of holding a three-second packet open indefinitely, and reports incompatible builds before attempting the old code-based protocol. Control admission/input initialization and video capture errors have explicit replies. The first observed terminal error is retained rather than always replaced by sibling-channel shutdown noise.
 
-If discovery is blocked, use **Share this computer**, copy its long private pairing code, and enter it under **Manual pairing (advanced)**. This older manual mode remains available and allows reconnects while sharing stays enabled. Only this manual mode keeps sharing enabled between sessions.
+If the Mac still closes a connection, check the stage in the Windows error and the Mac's Localnet status. Confirm both copies are 0.2.0, close duplicate instances, grant OS permissions, and verify the firewall and selected interface. Native screen-capture calls are not cancellable by socket shutdown and can still block shutdown until the OS call returns. Unclaimed internal session tickets expire after 30 seconds; canceled startup results are discarded.
 
-Windows Firewall must allow the executable on **Private** networks. Discovery uses UDP 5353 (mDNS), consent TCP 45778, and sharing TCP 45777. Wi-Fi client isolation, separate VLANs, or firewalls can prevent discovery. Interface/address changes require restarting discovery; select an interface then disable/re-enable it. Nothing here modifies firewall, router, startup, or privacy settings automatically.
+## Video and Input
 
-On a Windows viewer, Ctrl acts as the host's primary shortcut modifier: Command on Mac, Ctrl on Windows. On a Mac viewer, Command maps to Ctrl when controlling Windows and to Command when controlling another Mac. Copy/cut/paste use the **remote clipboard**, not your local clipboard. Ctrl+C from Windows into a Mac terminal therefore means Command+C, not SIGINT; full native Control shortcut support needs a future key-mapping setting. OS-reserved shortcuts are not intercepted.
+- Windows uses persistent native DXGI Desktop Duplication with a reusable staging texture and screenshot fallback. Mac still uses xcap's deprecated screenshot API, not ScreenCaptureKit.
+- Native libjpeg-turbo SIMD encoding/decoding uses reusable buffers and full chroma resolution for colored text. This is CPU JPEG acceleration, **not hardware H.264/HEVC/AV1**.
+- Video uses one requested frame at a time and a latest-frame-only decoded mailbox. Decode completes before the next request, allowing explicit terminal-error acknowledgment and avoiding an unbounded stale-frame queue.
+- Input uses a separate TLS/TCP connection with TCP_NODELAY. Adjacent pointer moves coalesce without crossing button events. Input batches and backlogs are bounded.
+- Normal packet deadlines are three seconds, with 250 ms idle input heartbeats. Startup polls separately for up to 60 seconds. Partial packets terminate the session rather than replaying bytes.
+- Retina/scaled pointer mapping uses host logical bounds separately from capture pixel dimensions and accounts for letterboxing.
 
-Connect to up to **four computers in one window**. Use the named session tabs to choose which screen gets your input; switching releases input on the previous computer and drops stale events. Inactive sessions keep receiving video and consume bandwidth/CPU. Each shared computer currently accepts one viewer. Names/sessions exist only while the app is running; no saved computer list or persistent credentials are implemented.
+Defaults are 1920px maximum width, quality 70, and a **60 FPS cap**, not guaranteed 60 FPS. Lower width/quality if slow and use Ethernet where possible. UI input ACK round-trip and receive/decode timings are not physical input-to-photon latency.
 
-You can share your own computer while connected to others. If someone connects to control this computer, outgoing remote input is paused (video continues), to avoid forwarding their injected keyboard/mouse events into another machine or forming control loops. Disconnect the incoming viewer or stop local sharing before resuming outgoing control.
+Previous local Windows release benchmarks at 1920x1080 measured original JPEG encoding around 72-75 ms versus native encoding around 12-15 ms, DXGI capture plus encoding typically 14-23 ms, and decoding/image conversion around 11-20 ms. These are small local pipeline measurements, not Mac/LAN/motion-video/60 FPS or near-zero-latency guarantees. A static desktop may reuse its last JPEG. Hardware encoding/decoding and ScreenCaptureKit remain future work.
 
-For **Mac controlling Windows** specifically: open Localnet on both, select the Windows PC under Nearby computers on Mac, enter the code shown on Windows, then approve on Windows. There is no separate controller/host download, just a build of Localnet for each OS.
+On a Windows viewer, Ctrl maps to Command on a Mac target and Ctrl on Windows. On a Mac viewer, Command maps to Ctrl on Windows and Command on Mac. Copy/cut/paste use the **remote clipboard**, not your local clipboard. Ctrl+C from Windows into a Mac terminal is Command+C, not SIGINT. Full physical-keyboard fidelity, non-US shortcut mapping, native Control/Alt shortcuts, IME behavior, and game-style key holds remain incomplete. OS-reserved shortcuts stay local.
 
-## Latency Design
+Primary monitor only. No audio, file transfer, secondary monitors, login/lock screen control, Windows UAC secure-desktop, Ctrl+Alt+Delete, or control of elevated apps from a normal process. Protected content/cursor capture can be absent. Keep the target awake, signed in, and unlocked. Held input release is best effort when permissions or OS injection fail.
 
-- Independent TLS/TCP channels for input and video, both with TCP_NODELAY. Large video frames cannot hold the input connection's lock.
-- One next video request is sent before decoding the current frame, overlapping capture with decoding while allowing at most one prefetched frame. Decoded frames use a latest-frame-only UI mailbox instead of an unbounded queue.
-- Windows uses persistent native DXGI Desktop Duplication with a reusable staging texture where available; startup/failure falls back to xcap screenshots. GPU frames are unmapped/released before network writes.
-- Native libjpeg-turbo SIMD encoding uses reusable buffers and direct BGRA input when no resize is needed. Full chroma resolution preserves colored desktop text. This is CPU JPEG acceleration, **not GPU H.264 encoding**.
-- Native SIMD JPEG decoding reuses the decoder and RGBA scratch buffer. Only baseline JPEG is accepted.
-- Adjacent mouse movements coalesce without crossing clicks. Input order is preserved, with a bounded backlog and disconnect on overflow.
-- Three-second absolute packet deadlines and 250 ms idle heartbeats. Partial packet timeouts terminate the connection, rather than replaying bytes.
-- Pointer mapping uses logical host display bounds, separate from capture pixel resolution, with letterbox correction for Retina/scaled displays.
+## Verification
 
-Defaults are 1920px maximum width, quality 70, and a 60 FPS cap; reduce width/quality if slow. Use Ethernet on both machines where possible. The UI reports **input acknowledgment round-trip** and **frame receive + decode duration**, not physical input-to-photon latency. Target FPS is a cap, not a performance promise. JPEG still uses substantial bandwidth and may not feel better than established remote-desktop tools yet. A static DXGI desktop reuses the last JPEG; this does not demonstrate new frames at 60 FPS.
+This remains a prototype, not a hardened remote-desktop product. Windows loopback capture/network paths are testable here; Mac builds, real two-computer Windows/Mac sessions, and live input fidelity must still be verified on your hardware. Native codec internal allocations and the mDNS library cache are not enforced process memory budgets; protocol packets, UI device counts, batches, and decoded output dimensions are bounded.
 
-On this development Windows PC at 1920x1080, release benchmarks measured the original JPEG encoder around 72-75 ms/frame versus native TurboJPEG around 12-15 ms/frame. New DXGI capture plus encoding typically measured 14-23 ms, with decode plus conversion to the viewer image around 11-20 ms. Static frame reuse can be faster, but is not fresh capture. These small local benchmarks are not an end-to-end LAN, Mac, motion-video, 60 FPS, or input-to-photon measurement.
-
-The next performance phase should use ScreenCaptureKit + VideoToolbox on Mac and hardware encoding on Windows, hardware decode, and a tightly bounded streaming transport. This prototype does **not** provide H.264/HEVC/AV1, zero-copy rendering, smooth 60 FPS, audio, or measured near-native latency.
-
-## Security and Limits
-
-- Discovery starts with the app, but screen sharing requires explicit code verification plus Allow, or manual Share this computer. Nothing starts at login or runs covertly.
-- TLS 1.3 with normal certificate/name/signature verification plus exact leaf pinning. Discovery certificates are provisional/untrusted: SPAKE2 and bidirectional HMAC confirmation bound to the TLS exporter authenticate knowledge of the short code before approval. The code is never published or transmitted as plaintext. The host's fresh sharing certificate/credential is transferred only on that verified connection. Manual codes enroll the certificate out of band. No insecure TLS verifier or OS-wide trust installation.
-- The SPAKE2 implementation and this integration have not received an independent security audit. One random code, one attempt per request, 90-second approval expiry, five-second request throttling, bounded prompts/workers, and deny-by-default are safeguards, not a claim of production-hardening. Code verification alone does not start capture or permit input.
-- Fresh in-memory certificate and 256-bit access credential whenever Host starts. Stopping/restarting sharing invalidates the old code. Credentials are not stored in configuration files or logged, but copying the code uses the local clipboard, which can retain it.
-- Bind only to the selected private interface (manual sharing also supports loopback); reject public IP routes/peers. mDNS publishes only name/version/public certificate and excludes loopback candidates. No cloud relay, NAT traversal, shell commands, or file transfer. Private IP checks are not proof of the same physical LAN: VPN/private routed networks and router port forwarding still require care. Do not expose this prototype to the Internet.
-- Resource-bounded connections, packets, input batches, discovered-device UI cache, and JPEG dimensions. Decoder output is checked before allocation (3840x2160 and 32 MiB maximum RGBA); progressive/lossless/arithmetic JPEG is rejected and a scan limit is configured. Native decoder internal allocations are not an OS-enforced memory budget. This is not hardened against a hostile LAN's denial-of-service traffic; the mDNS library's full internal cache is not bounded by our UI cache limit.
-- Primary monitor only. No secondary monitors, login/lock screen control, Windows UAC secure-desktop, Ctrl+Alt+Delete, or control of elevated Windows apps from a normal process.
-- Held keys/buttons are tracked and release is attempted on session end. OS permission changes can prevent injection or release; this cannot guarantee recovery when the OS refuses input.
-- Printable typing uses committed Unicode text; letter shortcuts use US-layout physical key positions. Full physical keyboard fidelity, non-US shortcut mapping, native control-only/Alt shortcuts, game key holds, left/right modifiers, numpad distinctions, and IME behavior remain incomplete.
-- Screenshot capture may omit protected content or the remote cursor. The local cursor gives immediate feedback but does not prove remote cursor position. xcap's Mac screenshot API is deprecated; a ScreenCaptureKit backend is needed for long-term support.
-- Keep the controlled computer awake, unlocked, and signed in. This app does not change power settings.
-
-## Verify
+With CMake/NASM available on PATH:
 
 ```sh
 cargo fmt --check
 cargo check --locked
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
+cargo test --release --locked -- --ignored --test-threads=1 --nocapture
 ```
 
-Before real use, test Windows-to-Mac and Mac-to-Windows over your LAN: permissions denied/revoked, Retina/Windows DPI corner targeting, text and shortcuts, dragging out of the image, focus loss while holding a key/button, cable removal, host revocation, display reconfiguration, and repeated connect/disconnect. Measure input-to-photon latency on the actual hardware before claiming a latency improvement.
+Ignored tests require an unlocked desktop/private LAN and capture frames to memory only. They do not inject keyboard/mouse input. Test permission denial/revocation, host busy, disconnect/reconnect, cable removal, app closure, display changes, Retina/Windows DPI corners, dragging out of the image, focus loss with held input, and native Mac permissions before normal use.
