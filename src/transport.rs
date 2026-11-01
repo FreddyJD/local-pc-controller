@@ -104,6 +104,14 @@ pub fn connect(pair: &Pairing, config: Arc<ClientConfig>, life: &Lifetime) -> Re
         DeadlineSocket::new(socket)?,
     );
     stream.conn.complete_io(&mut stream.sock)?;
+    anyhow::ensure!(
+        stream
+            .conn
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .is_some_and(|cert| cert.as_ref() == pair.certificate.as_slice()),
+        "Host certificate changed"
+    );
     Ok(stream)
 }
 

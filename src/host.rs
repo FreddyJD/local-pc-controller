@@ -8,7 +8,10 @@ use anyhow::{Result, ensure};
 use rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
 use std::{
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -27,6 +30,9 @@ pub struct Host {
     life: Arc<Lifetime>,
     session: Arc<Mutex<Option<Arc<Session>>>>,
     worker: Option<JoinHandle<()>>,
+    claimed: Arc<AtomicBool>,
+    started: Instant,
+    single_use: bool,
 }
 
 struct Session {
@@ -38,9 +44,17 @@ struct Session {
 
 impl Host {
     pub fn start(ip: IpAddr, settings: VideoSettings) -> Result<Self> {
+        Self::start_inner(ip, settings, false)
+    }
+
+    pub fn start_approved(ip: IpAddr, settings: VideoSettings) -> Result<Self> {
+        Self::start_inner(ip, settings, true)
+    }
+
+    fn start_inner(ip: IpAddr, settings: VideoSettings, single_use: bool) -> Result<Self> {
         ensure!(is_local(ip), "Select a private LAN interface");
         ensure!(
-            (1..=30).contains(&settings.fps)
+            (1..=60).contains(&settings.fps)
                 && (640..=3840).contains(&settings.width)
                 && (20..=95).contains(&settings.quality),
             "Invalid video settings"
@@ -74,11 +88,21 @@ impl Host {
         )));
         let life = Arc::new(Lifetime::default());
         let session = Arc::new(Mutex::new(None::<Arc<Session>>));
+        let claimed = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
         let worker = {
+            let claimed = claimed.clone();
             let (life, session, status) = (life.clone(), session.clone(), status.clone());
             thread::spawn(move || {
                 let mut workers: Vec<JoinHandle<()>> = Vec::new();
                 while !life.stopped() {
+                    if single_use
+                        && !claimed.load(Ordering::Relaxed)
+                        && started.elapsed() > Duration::from_secs(30)
+                    {
+                        life.stop();
+                        break;
+                    }
                     let mut index = 0;
                     while index < workers.len() {
                         if workers[index].is_finished() {
@@ -97,6 +121,7 @@ impl Host {
                                 display.clone(),
                                 life.clone(),
                             );
+                            let claimed = claimed.clone();
                             workers.push(thread::spawn(move || {
                                 // Authentication failures intentionally do not reveal credentials or disrupt UI status.
                                 let result = connection(
@@ -109,6 +134,9 @@ impl Host {
                                     display,
                                     settings,
                                     host_life,
+                                    single_use,
+                                    claimed,
+                                    started,
                                 );
                                 #[cfg(test)]
                                 if let Err(e) = result {
@@ -142,6 +170,9 @@ impl Host {
             life,
             session,
             worker: Some(worker),
+            claimed,
+            started,
+            single_use,
         })
     }
 
@@ -158,6 +189,13 @@ impl Host {
             .unwrap()
             .as_ref()
             .is_some_and(|session| !session.life.stopped())
+    }
+
+    pub fn approval_finished(&self) -> bool {
+        self.single_use
+            && ((self.claimed.load(Ordering::Relaxed) && self.session.lock().unwrap().is_none())
+                || (!self.claimed.load(Ordering::Relaxed)
+                    && self.started.elapsed() > Duration::from_secs(30)))
     }
 }
 
@@ -181,6 +219,9 @@ fn connection(
     display: DisplayInfo,
     settings: VideoSettings,
     host_life: Arc<Lifetime>,
+    single_use: bool,
+    claimed: Arc<AtomicBool>,
+    started: Instant,
 ) -> Result<()> {
     let cancellation = socket.try_clone()?;
     let mut stream = transport::accept(socket, config)?;
@@ -206,12 +247,24 @@ fn connection(
                     slot.is_none() && !host_life.stopped(),
                     "Host busy or stopped"
                 );
+                if single_use {
+                    ensure!(
+                        started.elapsed() < Duration::from_secs(30)
+                            && claimed
+                                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok(),
+                        "Approval expired or used"
+                    );
+                }
                 *slot = Some(active.clone());
             }
             *status.lock().unwrap() =
                 format!("Viewer connected from {peer}. Stop sharing to revoke access.");
             let result = control(&mut stream, &active, &display);
             active.life.stop();
+            if single_use {
+                host_life.stop();
+            }
             *sessions.lock().unwrap() = None;
             *status.lock().unwrap() = match &result {
                 Ok(_) => "Viewer disconnected. Waiting for another connection.".into(),
@@ -273,7 +326,7 @@ fn video(
     expected: &DisplayInfo,
     settings: VideoSettings,
 ) -> Result<()> {
-    let monitor = capture::primary()?;
+    let mut capture = capture::VideoCapture::new(settings.width, settings.quality)?;
     let interval = Duration::from_secs_f64(1.0 / f64::from(settings.fps));
     let mut next = Instant::now();
     while !session.life.stopped() {
@@ -283,7 +336,7 @@ fn video(
         if let Some(wait) = next.checked_duration_since(Instant::now()) {
             thread::sleep(wait);
         }
-        let actual = capture::info(&monitor)?;
+        let actual = capture.display()?;
         ensure!(
             actual.width == expected.width
                 && actual.height == expected.height
@@ -293,8 +346,8 @@ fn video(
         );
         ensure!(!session.life.stopped(), "Session stopped");
         let started = Instant::now();
-        let bytes = capture::jpeg(&monitor, settings.width, settings.quality)?;
-        write_packet(stream, &bytes, MAX_FRAME)?;
+        let bytes = capture.frame()?;
+        write_packet(stream, bytes, MAX_FRAME)?;
         next = started + interval;
     }
     Ok(())
@@ -353,5 +406,47 @@ mod tests {
             assert!(host.session.lock().unwrap().is_none());
         }
         host.stop();
+    }
+
+    #[test]
+    #[ignore = "Interactive desktop capture over loopback; verifies approved token cannot reconnect; no input injection"]
+    fn approved_session_is_single_use() {
+        let host = Host::start_approved(
+            "127.0.0.1".parse().unwrap(),
+            VideoSettings {
+                fps: 60,
+                width: 1920,
+                quality: 70,
+            },
+        )
+        .unwrap();
+        let pair = Pairing::decode(&host.pairing).unwrap();
+        let ctx = eframe::egui::Context::default();
+        let viewer = crate::viewer::Viewer::start(pair.clone(), ctx.clone());
+        let until = Instant::now() + Duration::from_secs(10);
+        while viewer.state.lock().unwrap().frames < 3 {
+            assert!(
+                viewer.connected(),
+                "{}",
+                viewer.state.lock().unwrap().status
+            );
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(host.has_viewer());
+        viewer.stop();
+        drop(viewer);
+        let until = Instant::now() + Duration::from_secs(5);
+        while !host.approval_finished() {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(20));
+        }
+        let viewer = crate::viewer::Viewer::start(pair, ctx);
+        let until = Instant::now() + Duration::from_secs(5);
+        while viewer.connected() {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(viewer.state.lock().unwrap().frames, 0);
     }
 }

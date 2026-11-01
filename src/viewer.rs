@@ -6,7 +6,6 @@ use anyhow::{Result, ensure};
 use eframe::egui;
 use std::{
     collections::VecDeque,
-    io::Cursor,
     sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -177,12 +176,16 @@ fn session(
         let (state, life, ctx) = (state.clone(), life.clone(), ctx.clone());
         thread::spawn(move || {
             let result = (|| -> Result<()> {
+                let mut decoder = FrameDecoder::new()?;
+                video.sock.renew();
+                write_json(&mut video, &true)?;
                 while !life.stopped() {
                     let start = Instant::now();
                     video.sock.renew();
-                    write_json(&mut video, &true)?;
                     let bytes = read_packet(&mut video, MAX_FRAME)?;
-                    let frame = decode_frame(&bytes)?;
+                    // Request only one next frame before decoding this one, overlapping capture with decode.
+                    write_json(&mut video, &true)?;
+                    let frame = decoder.decode(&bytes)?;
                     let mut state = state.lock().unwrap();
                     state.frame = Some(frame);
                     state.frames += 1;
@@ -220,19 +223,63 @@ fn session(
     result
 }
 
+pub struct FrameDecoder {
+    decoder: turbojpeg::Decompressor,
+    rgba: Vec<u8>,
+}
+
+impl FrameDecoder {
+    pub fn new() -> Result<Self> {
+        let mut decoder = turbojpeg::Decompressor::new()?;
+        decoder.set_scan_limit(16)?;
+        Ok(Self {
+            decoder,
+            rgba: Vec::new(),
+        })
+    }
+
+    pub fn decode(&mut self, bytes: &[u8]) -> Result<egui::ColorImage> {
+        ensure!(
+            !bytes.is_empty() && bytes.len() <= MAX_FRAME,
+            "Invalid frame size"
+        );
+        let header = self.decoder.read_header(bytes)?;
+        ensure!(
+            header.width > 0 && header.height > 0 && header.width <= 3840 && header.height <= 2160,
+            "Frame dimensions exceed limit"
+        );
+        ensure!(
+            !header.is_lossless && !header.is_arithmetic && !header.is_progressive,
+            "Only baseline JPEG is accepted"
+        );
+        let length = header
+            .width
+            .checked_mul(header.height)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| anyhow::anyhow!("Frame allocation overflow"))?;
+        ensure!(length <= 32 * 1024 * 1024, "Frame allocation exceeds limit");
+        self.rgba.resize(length, 0);
+        self.decoder.decompress(
+            bytes,
+            turbojpeg::Image {
+                pixels: &mut self.rgba,
+                width: header.width,
+                height: header.height,
+                pitch: header.width * 4,
+                format: turbojpeg::PixelFormat::RGBA,
+            },
+        )?;
+        // JPEG has no alpha; TurboJPEG RGBA output is opaque, so premultiplication is unnecessary.
+        Ok(egui::ColorImage::from_rgba_premultiplied(
+            [header.width, header.height],
+            &self.rgba,
+        ))
+    }
+}
+
+#[cfg(test)]
 pub fn decode_frame(bytes: &[u8]) -> Result<egui::ColorImage> {
-    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Jpeg);
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(3840);
-    limits.max_image_height = Some(2160);
-    limits.max_alloc = Some(64 * 1024 * 1024);
-    reader.limits(limits);
-    let image = reader.decode()?.to_rgba8();
-    ensure!(image.width() > 0 && image.height() > 0, "Empty video frame");
-    Ok(egui::ColorImage::from_rgba_unmultiplied(
-        [image.width() as usize, image.height() as usize],
-        &image,
-    ))
+    FrameDecoder::new()?.decode(bytes)
 }
 
 #[cfg(test)]
@@ -279,5 +326,19 @@ mod tests {
             .encode_image(&large)
             .unwrap();
         assert!(decode_frame(&bytes).is_err());
+        let mut compressor = turbojpeg::Compressor::new().unwrap();
+        compressor.set_quality(70).unwrap();
+        compressor.set_subsamp(turbojpeg::Subsamp::None).unwrap();
+        compressor.set_progressive(true).unwrap();
+        let jpeg = compressor
+            .compress_to_vec(turbojpeg::Image {
+                pixels: &[20; 48],
+                width: 4,
+                height: 4,
+                pitch: 12,
+                format: turbojpeg::PixelFormat::RGB,
+            })
+            .unwrap();
+        assert!(decode_frame(&jpeg).is_err());
     }
 }

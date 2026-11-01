@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod capture;
+mod discovery;
 mod host;
 mod input;
 mod protocol;
@@ -19,6 +20,10 @@ fn main() -> eframe::Result {
                 .with_min_inner_size([640.0, 480.0]),
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(ui::Localnet::new(&cc.egui_ctx)))),
+        Box::new(|cc| {
+            let mut app = ui::Localnet::new(&cc.egui_ctx);
+            app.enable_discovery();
+            Ok(Box::new(app))
+        }),
     )
 }
