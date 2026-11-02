@@ -414,6 +414,18 @@ impl eframe::App for Localnet {
             .as_ref()
             .and_then(|outgoing| outgoing.state.lock().unwrap().result.take());
         if let Some(result) = result {
+            if self
+                .outgoing
+                .as_ref()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .refresh_discovery
+                && let Some(discovery) = &self.discovery
+            {
+                discovery.refresh_nearby();
+            }
             let name = self.outgoing.as_ref().unwrap().device.name.clone();
             self.outgoing.take();
             match result.and_then(|pair| {
@@ -461,6 +473,10 @@ impl eframe::App for Localnet {
                                 egui::Button::new(format!("Connect to {}", device.name))).clicked() {
                                 self.connect_device(device);
                             }
+                        }
+                        if ui.button("Refresh nearby computers").clicked()
+                            && let Some(discovery) = &self.discovery {
+                            discovery.refresh_nearby();
                         }
                         if ui.button("Disable local access / disconnect incoming viewer").clicked() { self.discovery.take(); }
                         ctx.request_repaint_after(Duration::from_millis(100));

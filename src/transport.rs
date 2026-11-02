@@ -96,6 +96,18 @@ pub fn client_config(pair: &SessionTicket) -> Result<Arc<ClientConfig>> {
     ))
 }
 
+pub fn is_certificate_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let tls = cause.downcast_ref::<rustls::Error>().or_else(|| {
+            cause
+                .downcast_ref::<io::Error>()?
+                .get_ref()?
+                .downcast_ref::<rustls::Error>()
+        });
+        matches!(tls, Some(rustls::Error::InvalidCertificate(_)))
+    })
+}
+
 pub fn connect(
     pair: &SessionTicket,
     config: Arc<ClientConfig>,
@@ -108,14 +120,17 @@ pub fn connect(
         DeadlineSocket::new(socket)?,
     );
     stream.conn.complete_io(&mut stream.sock)?;
-    anyhow::ensure!(
-        stream
-            .conn
-            .peer_certificates()
-            .and_then(|certs| certs.first())
-            .is_some_and(|cert| cert.as_ref() == pair.certificate.as_slice()),
-        "Host certificate changed"
-    );
+    if !stream
+        .conn
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .is_some_and(|cert| cert.as_ref() == pair.certificate.as_slice())
+    {
+        return Err(anyhow::Error::new(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        ))
+        .context("Host certificate changed"));
+    }
     Ok(stream)
 }
 
@@ -144,9 +159,12 @@ mod tests {
     fn tls_verifies_discovered_certificate_and_rejects_another_host() {
         use crate::protocol::{VERSION, read_json, write_json};
         use rustls::pki_types::PrivatePkcs8KeyDer;
-        for trust_correct_cert in [true, false] {
+        for case in 0..3 {
             let identity = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into()]).unwrap();
             let other = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into()]).unwrap();
+            let mut params = rcgen::CertificateParams::new(vec![SERVER_NAME.into()]).unwrap();
+            params.serial_number = Some(42u64.into());
+            let same_key = params.self_signed(&identity.signing_key).unwrap();
             let config = Arc::new(
                 ServerConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),
@@ -166,10 +184,10 @@ mod tests {
                 version: VERSION,
                 address: listener.local_addr().unwrap(),
                 token: "a".repeat(64),
-                certificate: if trust_correct_cert {
-                    identity.cert.der().to_vec()
-                } else {
-                    other.cert.der().to_vec()
+                certificate: match case {
+                    0 => identity.cert.der().to_vec(),
+                    1 => other.cert.der().to_vec(),
+                    _ => same_key.der().to_vec(),
                 },
             };
             let server = std::thread::spawn(move || -> Result<()> {
@@ -187,8 +205,12 @@ mod tests {
                 write_json(&mut stream, &text)
             });
             let result = connect(&pair, client_config(&pair).unwrap(), &Lifetime::default());
-            if trust_correct_cert {
+            if case == 0 {
                 let mut stream = result.unwrap();
+                assert_eq!(
+                    stream.conn.protocol_version(),
+                    Some(rustls::ProtocolVersion::TLSv1_3)
+                );
                 write_json(&mut stream, &"encrypted loopback").unwrap();
                 assert_eq!(
                     read_json::<String>(&mut stream).unwrap(),
@@ -196,7 +218,28 @@ mod tests {
                 );
                 assert!(server.join().unwrap().is_ok());
             } else {
-                assert!(result.is_err());
+                let error = result.err().unwrap();
+                assert!(is_certificate_error(&error));
+                if case == 1 {
+                    let tls_error = error
+                        .downcast_ref::<io::Error>()
+                        .and_then(io::Error::get_ref)
+                        .and_then(|error| error.downcast_ref::<rustls::Error>());
+                    assert!(
+                        matches!(
+                            tls_error,
+                            Some(rustls::Error::InvalidCertificate(
+                                rustls::CertificateError::BadSignature
+                            ))
+                        ),
+                        "{error:#}"
+                    );
+                } else {
+                    assert!(
+                        error.to_string().contains("Host certificate changed"),
+                        "{error:#}"
+                    );
+                }
                 assert!(server.join().unwrap().is_err());
             }
         }
