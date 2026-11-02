@@ -567,7 +567,7 @@ fn outgoing(
 ) -> Result<SessionTicket> {
     ensure!(
         device.compatible(),
-        "Update Localnet on both computers to 0.3.0 (gallery preview protocol). Incompatible computer: {}.",
+        "Update Localnet on both computers to 0.4.0 (video and keyboard fixes). Incompatible computer: {}.",
         device.name
     );
     let provisional = SessionTicket {
@@ -620,7 +620,7 @@ fn outgoing(
 pub fn fetch_preview(device: &Device, life: &Lifetime) -> Result<Vec<u8>> {
     ensure!(
         device.compatible(),
-        "Update Localnet on both computers to 0.3.0"
+        "Update Localnet on both computers to 0.4.0"
     );
     let provisional = SessionTicket {
         version: protocol::VERSION,

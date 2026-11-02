@@ -1,4 +1,5 @@
 use crate::{
+    latest::Latest,
     protocol::*,
     transport::{self, Lifetime},
 };
@@ -19,6 +20,14 @@ pub struct ViewerState {
     pub frames: u64,
     pub input_rtt_ms: f64,
     pub frame_roundtrip_ms: f64,
+    pub received: u64,
+    pub compressed_replaced: u64,
+    pub decoded_replaced: u64,
+    pub decode_ms: f64,
+    pub receive_ms: f64,
+    pub decoded_at: Option<Instant>,
+    pub received_fps: f64,
+    pub decoded_fps: f64,
 }
 
 #[derive(Default)]
@@ -191,40 +200,103 @@ fn session(
         let first_error = first_error.clone();
         let (state, life, ctx) = (state.clone(), life.clone(), ctx.clone());
         thread::spawn(move || {
-            let result = (|| -> Result<()> {
-                let mut decoder = FrameDecoder::new()?;
-                video.sock.renew();
-                write_json(&mut video, &true)?;
-                while !life.stopped() {
-                    let start = Instant::now();
-                    video.sock.renew();
-                    let bytes = match read_frame(&mut video) {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            first_error
-                                .lock()
-                                .unwrap()
-                                .get_or_insert(format!("Video frame: {error:#}"));
-                            let _ = write_json(&mut video, &true);
-                            return Err(error.context("Video frame"));
-                        }
+            let compressed = Arc::new(Latest::<Vec<u8>>::default());
+            let decode_worker = {
+                let (compressed, state, life, ctx, first_error) = (
+                    compressed.clone(),
+                    state.clone(),
+                    life.clone(),
+                    ctx.clone(),
+                    first_error.clone(),
+                );
+                thread::spawn(move || {
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                            let mut decoder = FrameDecoder::new()?;
+                            let mut rate = (Instant::now(), 0_u64);
+                            while let Some(bytes) = compressed.take(&life)? {
+                                let start = Instant::now();
+                                let frame = decoder.decode(&bytes)?;
+                                let mut state = state.lock().unwrap();
+                                if state.frame.replace(frame).is_some() {
+                                    state.decoded_replaced += 1;
+                                }
+                                state.frames += 1;
+                                state.decode_ms = start.elapsed().as_secs_f64() * 1000.0;
+                                state.decoded_at = Some(Instant::now());
+                                if rate.0.elapsed() >= Duration::from_secs(1) {
+                                    state.decoded_fps = (state.frames - rate.1) as f64
+                                        / rate.0.elapsed().as_secs_f64();
+                                    rate = (Instant::now(), state.frames);
+                                }
+                                drop(state);
+                                ctx.request_repaint();
+                            }
+                            Ok(())
+                        }));
+                    let error = match result {
+                        Ok(Ok(())) => None,
+                        Ok(Err(e)) => Some(format!("Decode: {e:#}")),
+                        Err(_) => Some("Decoder worker panicked".into()),
                     };
-                    // Finish decoding before requesting again so a terminal error can be acknowledged explicitly.
-                    let frame = decoder.decode(&bytes)?;
+                    if let Some(error) = error {
+                        first_error.lock().unwrap().get_or_insert(error);
+                        life.stop();
+                    }
+                })
+            };
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let mut rate = (Instant::now(), 0_u64);
+                    video.sock.renew();
                     write_json(&mut video, &true)?;
-                    let mut state = state.lock().unwrap();
-                    state.frame = Some(frame);
-                    state.frames += 1;
-                    state.frame_roundtrip_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    drop(state);
-                    ctx.request_repaint();
-                }
-                Ok(())
-            })();
+                    while !life.stopped() {
+                        let start = Instant::now();
+                        video.sock.renew();
+                        let bytes = match read_frame(&mut video) {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                first_error
+                                    .lock()
+                                    .unwrap()
+                                    .get_or_insert(format!("Video frame: {error:#}"));
+                                // Only acknowledge a complete terminal error; a partial frame has lost framing.
+                                if error.is::<RemoteVideoError>() {
+                                    let _ = write_json(&mut video, &true);
+                                }
+                                return Err(error.context("Video frame"));
+                            }
+                        };
+                        // This thread owns TLS; decoding runs independently with one replaceable JPEG slot.
+                        if !compressed.publish(bytes) {
+                            break;
+                        }
+                        write_json(&mut video, &true)?;
+                        let mut state = state.lock().unwrap();
+                        state.received += 1;
+                        state.receive_ms = start.elapsed().as_secs_f64() * 1000.0;
+                        state.frame_roundtrip_ms = state.receive_ms;
+                        state.compressed_replaced = compressed.replaced();
+                        if rate.0.elapsed() >= Duration::from_secs(1) {
+                            state.received_fps =
+                                (state.received - rate.1) as f64 / rate.0.elapsed().as_secs_f64();
+                            rate = (Instant::now(), state.received);
+                        }
+                    }
+                    Ok(())
+                }))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Video receiver worker panicked")));
             if let Err(e) = &result {
                 first_error.lock().unwrap().get_or_insert(format!("{e:#}"));
             }
             life.stop();
+            compressed.close(None);
+            if decode_worker.join().is_err() {
+                first_error
+                    .lock()
+                    .unwrap()
+                    .get_or_insert("Decoder worker panicked".into());
+            }
             result
         })
     };

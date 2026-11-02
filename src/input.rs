@@ -7,6 +7,7 @@ pub struct InputDevice {
     keys: Vec<Key>,
     buttons: Vec<Button>,
     modifiers: Modifiers,
+    raw_keys: Vec<u16>,
 }
 
 impl InputDevice {
@@ -19,6 +20,7 @@ impl InputDevice {
             keys: Vec::new(),
             buttons: Vec::new(),
             modifiers: Modifiers::default(),
+            raw_keys: Vec::new(),
         })
     }
 
@@ -84,8 +86,25 @@ impl InputDevice {
             }
             Input::Modifiers(value) => self.set_modifiers(value)?,
             Input::Key { name, pressed } => {
-                let key = named_key(&name).ok_or_else(|| anyhow::anyhow!("Unsupported key"))?;
-                self.key(key, pressed)?;
+                if let Some(code) = modified_key_code(&name) {
+                    if pressed && !self.raw_keys.contains(&code) {
+                        self.raw_keys.push(code);
+                    }
+                    self.enigo.raw(
+                        code,
+                        if pressed {
+                            Direction::Press
+                        } else {
+                            Direction::Release
+                        },
+                    )?;
+                    if !pressed {
+                        self.raw_keys.retain(|c| *c != code);
+                    }
+                } else {
+                    let key = named_key(&name).ok_or_else(|| anyhow::anyhow!("Unsupported key"))?;
+                    self.key(key, pressed)?;
+                }
             }
             Input::Text(text) => {
                 ensure!(
@@ -119,6 +138,9 @@ impl InputDevice {
     }
 
     pub fn release_all(&mut self) {
+        for code in self.raw_keys.drain(..) {
+            let _ = self.enigo.raw(code, Direction::Release);
+        }
         for button in self.buttons.drain(..) {
             let _ = self.enigo.button(native_button(button), Direction::Release);
         }
@@ -144,13 +166,16 @@ fn native_button(button: Button) -> enigo::Button {
 }
 
 fn modifier_keys(value: Modifiers) -> Vec<Key> {
+    modifier_keys_for(value, cfg!(target_os = "macos"))
+}
+
+fn modifier_keys_for(value: Modifiers, mac: bool) -> Vec<Key> {
     let mut keys = Vec::new();
     if value.primary {
-        keys.push(if cfg!(target_os = "macos") {
-            Key::Meta
-        } else {
-            Key::Control
-        });
+        keys.push(if mac { Key::Meta } else { Key::Control });
+    }
+    if value.meta && !keys.contains(&Key::Meta) {
+        keys.push(Key::Meta);
     }
     if value.control && !keys.contains(&Key::Control) {
         keys.push(Key::Control);
@@ -162,6 +187,14 @@ fn modifier_keys(value: Modifiers) -> Vec<Key> {
         keys.push(Key::Shift);
     }
     keys
+}
+
+pub fn modified_key_code(name: &str) -> Option<u16> {
+    let b = *name.as_bytes().first()?;
+    if name.len() != 1 || !b.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(shortcut_code((b as char).to_ascii_lowercase()))
 }
 
 // Shortcut letters use US-layout physical positions. Ordinary typing uses committed Unicode text.
@@ -184,6 +217,7 @@ pub fn named_key(name: &str) -> Option<Key> {
         "Enter" => Key::Return,
         "Escape" => Key::Escape,
         "Tab" => Key::Tab,
+        "Space" => Key::Space,
         "Backspace" => Key::Backspace,
         "Delete" => Key::Delete,
         "Left" => Key::LeftArrow,
@@ -228,5 +262,32 @@ mod tests {
         });
         assert_eq!(keys.iter().filter(|k| **k == Key::Control).count(), 1);
         assert!(shortcut_code('a') != shortcut_code('z'));
+    }
+
+    #[test]
+    fn meta_maps_to_command_on_mac_and_windows_on_pc_without_double_press() {
+        let both = Modifiers {
+            primary: true,
+            meta: true,
+            ..Default::default()
+        };
+        assert_eq!(modifier_keys_for(both, true), vec![Key::Meta]);
+        assert_eq!(
+            modifier_keys_for(both, false),
+            vec![Key::Control, Key::Meta]
+        );
+        assert_eq!(
+            modifier_keys_for(
+                Modifiers {
+                    meta: true,
+                    ..Default::default()
+                },
+                true
+            ),
+            vec![Key::Meta]
+        );
+        assert_eq!(named_key("Space"), Some(Key::Space));
+        assert_eq!(modified_key_code("A"), modified_key_code("a"));
+        assert!(modified_key_code("Other(1234)").is_none());
     }
 }

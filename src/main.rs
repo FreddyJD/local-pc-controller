@@ -6,6 +6,8 @@ mod chrome;
 mod discovery;
 mod host;
 mod input;
+mod keyboard;
+mod latest;
 mod preview;
 mod protocol;
 mod transport;
@@ -33,6 +35,7 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             let mut app = ui::Localnet::new(&cc.egui_ctx);
             app.chrome = chrome::Chrome::install(cc);
+            app.keyboard = keyboard::Keyboard::install(cc);
             app.enable_discovery();
             Ok(Box::new(app))
         }),

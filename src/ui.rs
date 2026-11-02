@@ -8,7 +8,7 @@ use crate::{
 };
 use eframe::egui::{self, Color32, Event, Rect, TextureHandle, TextureOptions};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
@@ -20,6 +20,8 @@ struct RemoteSession {
     address: SocketAddr,
     viewer: Viewer,
     texture: Option<TextureHandle>,
+    uploads: u64,
+    upload_age_ms: f64,
 }
 
 struct TileTexture {
@@ -28,6 +30,7 @@ struct TileTexture {
 }
 
 pub struct Localnet {
+    pub keyboard: crate::keyboard::Keyboard,
     pub chrome: crate::chrome::Chrome,
     interfaces: Vec<(String, IpAddr)>,
     interface: usize,
@@ -49,6 +52,7 @@ pub struct Localnet {
     previews: Option<Previews>,
     thumbnails: HashMap<SocketAddr, TileTexture>,
     logo: egui::TextureHandle,
+    modified_keys: HashSet<String>,
 }
 
 impl Localnet {
@@ -111,6 +115,7 @@ impl Localnet {
             "127.0.0.1".parse().unwrap(),
         ));
         Self {
+            keyboard: Default::default(),
             chrome: Default::default(),
             interfaces,
             interface: 0,
@@ -136,6 +141,7 @@ impl Localnet {
             previews: Some(Previews::new()),
             thumbnails: HashMap::new(),
             logo: crate::branding::mark(ctx),
+            modified_keys: HashSet::new(),
         }
     }
 
@@ -160,6 +166,8 @@ impl Localnet {
     }
 
     fn release(&mut self) {
+        self.keyboard.arm(false);
+        self.modified_keys.clear();
         self.send(Input::ReleaseAll);
         self.controlling = false;
         self.wheel = egui::Vec2::ZERO;
@@ -167,7 +175,8 @@ impl Localnet {
     }
 
     fn sync_modifiers(&mut self, value: egui::Modifiers) {
-        let current = remote_modifiers(value);
+        let mut current = remote_modifiers(value);
+        current.meta = self.keyboard.meta();
         if current != self.last_modifiers {
             self.send(Input::Modifiers(current));
             self.last_modifiers = current;
@@ -227,7 +236,7 @@ impl Localnet {
     fn connect_device(&mut self, device: Device) {
         if !device.compatible() {
             self.error = format!(
-                "Update Localnet on {} and this computer to 0.3.0 to use screenshot previews and connect.",
+                "Update Localnet on {} and this computer to 0.4.0 for the video and keyboard fixes.",
                 device.name
             );
             return;
@@ -278,6 +287,8 @@ impl Localnet {
             address: pair.address,
             viewer: Viewer::start(pair, ctx.clone()),
             texture: None,
+            uploads: 0,
+            upload_age_ms: 0.0,
         });
         self.active = Some(self.sessions.len() - 1);
         self.gallery = false;
@@ -311,7 +322,27 @@ impl Localnet {
             }
             return;
         }
+        let (native, _, canceled) = self.keyboard.drain();
+        if canceled {
+            self.release();
+            return;
+        }
+        if self.controlling {
+            for event in native {
+                if let Input::Modifiers(modifiers) = event {
+                    self.last_modifiers = modifiers;
+                }
+                self.send(event);
+            }
+        }
+        let mut text_modifiers = self.modifiers;
         for event in events {
+            if let Event::Key { modifiers, .. }
+            | Event::PointerButton { modifiers, .. }
+            | Event::MouseWheel { modifiers, .. } = &event
+            {
+                text_modifiers = *modifiers;
+            }
             match event {
                 Event::Key {
                     key: egui::Key::F12,
@@ -341,6 +372,9 @@ impl Localnet {
                     }
                     if inside && pressed {
                         self.controlling = true;
+                        if !self.keyboard.arm(true) {
+                            self.error="Windows-key forwarding is unavailable. Ctrl still maps to Command on Mac.".into();
+                        }
                     }
                     if !self.controlling {
                         continue;
@@ -390,27 +424,36 @@ impl Localnet {
                 } if self.controlling => {
                     self.sync_modifiers(modifiers);
                     let name = key.name();
-                    if named_key(name).is_some() {
+                    let modified = modifiers.command
+                        || modifiers.ctrl
+                        || modifiers.alt
+                        || self.keyboard.meta();
+                    let letter = crate::input::modified_key_code(name).is_some();
+                    let was_modified = self.modified_keys.contains(name);
+                    if (letter || name == "Space") && (modified || was_modified) {
+                        if pressed {
+                            self.modified_keys.insert(name.into());
+                        } else {
+                            self.modified_keys.remove(name);
+                        }
                         self.send(Input::Key {
                             name: name.into(),
                             pressed,
                         });
-                    } else if pressed
-                        && modifiers.command
-                        && name.len() == 1
-                        && let Some(letter) = name.chars().next().filter(char::is_ascii_alphabetic)
-                    {
-                        self.send(Input::Shortcut {
-                            letter: letter.to_ascii_lowercase(),
-                            shift: modifiers.shift,
+                    } else if name != "Space" && named_key(name).is_some() {
+                        self.send(Input::Key {
+                            name: name.into(),
+                            pressed,
                         });
                     }
                 }
                 Event::Text(text) | Event::Ime(egui::ImeEvent::Commit(text))
                     if self.controlling =>
                 {
-                    if !self.modifiers.command
-                        && !self.modifiers.ctrl
+                    if !text_modifiers.command
+                        && !text_modifiers.ctrl
+                        && !text_modifiers.alt
+                        && !self.keyboard.meta()
                         && text.len() <= 4096
                         && !text.chars().any(char::is_control)
                     {
@@ -618,6 +661,17 @@ impl Localnet {
             }
             ui.separator();
             ui.small("Ctrl+Shift+F12 releases remote input. Copy/paste uses the remote clipboard.");
+            if let Some(index)=self.active {
+                let state=self.sessions[index].viewer.state.lock().unwrap();
+                ui.collapsing("Connection diagnostics",|ui| {
+                    ui.monospace(format!("Received: {:.1} FPS / Decoded: {:.1} FPS",state.received_fps,state.decoded_fps));
+                    ui.monospace(format!("Receive wait: {:.1} ms / Decode: {:.1} ms",state.receive_ms,state.decode_ms));
+                    ui.monospace(format!("Input ACK: {:.1} ms",state.input_rtt_ms));
+                    ui.monospace(format!("Replaced before decode: {} / Before UI: {}",state.compressed_replaced,state.decoded_replaced));
+                    ui.monospace(format!("UI texture updates: {} / Decoded-to-UI: {:.1} ms",self.sessions[index].uploads,self.sessions[index].upload_age_ms));
+                    ui.small("Receive time includes waiting for the host. FPS counts frames, including static repeats. These are not input-to-photon or display-present timings.");
+                });
+            }
             ui.small(format!("Localnet {} / LAN only / TLS encrypted", env!("CARGO_PKG_VERSION")));
             if ui.button("Disconnect everything and stop local access").clicked() { self.shutdown(); }
         });
@@ -707,7 +761,7 @@ impl Localnet {
                                 );
                             } else {
                                 let label = if !device.compatible() {
-                                    "Update Localnet to 0.3.0"
+                                    "Update Localnet to 0.4.0"
                                 } else if self
                                     .previews
                                     .as_ref()
@@ -871,6 +925,7 @@ fn remote_modifiers(value: egui::Modifiers) -> Modifiers {
         control: value.ctrl && !value.command,
         alt: value.alt,
         shift: value.shift,
+        meta: false,
     }
 }
 
@@ -904,7 +959,9 @@ impl eframe::App for Localnet {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.viewport().visible() == Some(false)) {
+        if ctx.input(|i| {
+            i.viewport().visible() == Some(false) || i.viewport().minimized == Some(true)
+        }) {
             if self.controlling {
                 self.release();
             }
@@ -995,8 +1052,14 @@ impl eframe::App for Localnet {
             }
         }
         for session in &mut self.sessions {
-            let image = session.viewer.state.lock().unwrap().frame.take();
+            let (image, decoded_at) = {
+                let mut state = session.viewer.state.lock().unwrap();
+                (state.frame.take(), state.decoded_at)
+            };
             if let Some(image) = image {
+                session.uploads += 1;
+                session.upload_age_ms =
+                    decoded_at.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
                 if image
                     .size
                     .iter()
@@ -1005,7 +1068,11 @@ impl eframe::App for Localnet {
                     self.error = "Frame exceeds GPU texture limit. Reduce host video width.".into();
                     session.viewer.stop();
                 } else if let Some(texture) = &mut session.texture {
-                    texture.set(image, TextureOptions::LINEAR);
+                    if texture.size() == image.size {
+                        texture.set_partial([0, 0], image, TextureOptions::LINEAR);
+                    } else {
+                        texture.set(image, TextureOptions::LINEAR);
+                    }
                 } else {
                     session.texture = Some(ctx.load_texture(
                         format!("remote-{}", session.address),
@@ -1101,10 +1168,102 @@ mod tests {
                 address: SocketAddr::from(([127, 0, 0, 1], port)),
                 viewer: Viewer::test_session(),
                 texture: None,
+                uploads: 0,
+                upload_age_ms: 0.0,
             });
         }
         app.active = Some(0);
         app
+    }
+
+    #[test]
+    fn command_space_and_control_letters_preserve_modifiers_and_key_releases() {
+        let mut app = app_with_sessions();
+        app.gallery = false;
+        app.controlling = true;
+        let command = egui::Modifiers {
+            command: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        for (key, modifiers) in [
+            (egui::Key::Space, command),
+            (egui::Key::A, command),
+            (
+                egui::Key::C,
+                egui::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            app.events = vec![
+                Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ];
+            app.modifiers = Default::default();
+            app.route_input();
+            let events = app.sessions[0].viewer.test_inputs();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e,Input::Modifiers(m) if m.primary||m.control))
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e,Input::Key{name,pressed:true} if name==key.name()))
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e,Input::Key{name,pressed:false} if name==key.name()))
+            );
+        }
+        app.release();
+        assert!(app.modified_keys.is_empty());
+    }
+
+    #[test]
+    fn focus_loss_and_emergency_shortcut_release_modified_keys() {
+        for event in [
+            Event::WindowFocused(false),
+            Event::Key {
+                key: egui::Key::F12,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            },
+        ] {
+            let mut app = app_with_sessions();
+            app.gallery = false;
+            app.controlling = true;
+            app.modified_keys.insert("A".into());
+            app.events.push(event);
+            app.route_input();
+            assert!(!app.controlling && app.modified_keys.is_empty());
+            assert!(matches!(
+                app.sessions[0].viewer.test_inputs().as_slice(),
+                [Input::ReleaseAll]
+            ));
+        }
     }
 
     #[test]

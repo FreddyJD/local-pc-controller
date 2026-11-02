@@ -1,6 +1,7 @@
 use crate::{
     capture,
     input::InputDevice,
+    latest::Latest,
     protocol::*,
     transport::{self, Lifetime, ServerStream},
 };
@@ -494,13 +495,6 @@ fn connection(
             let result = video(&mut stream, &active, &display, settings);
             if let Err(e) = &result {
                 *active.error.lock().unwrap() = Some(format!("Screen capture: {e:#}"));
-                stream.sock.renew();
-                let _ = write_frame_error(&mut stream, &format!("Screen capture: {e:#}"));
-            }
-            // Wait for the viewer to acknowledge a terminal frame error before canceling control.
-            if result.is_err() {
-                stream.sock.renew();
-                let _ = read_json::<bool>(&mut stream);
             }
             active.life.stop();
             result
@@ -560,31 +554,80 @@ fn video(
 ) -> Result<()> {
     stream.sock.renew();
     ensure!(read_json::<bool>(stream)?, "Invalid first frame request");
-    let mut capture = capture::VideoCapture::new(settings.width, settings.quality)?;
-    let interval = Duration::from_secs_f64(1.0 / f64::from(settings.fps));
-    let mut next = Instant::now();
-    while !session.life.stopped() {
-        stream.sock.renew();
-        if let Some(wait) = next.checked_duration_since(Instant::now()) {
-            thread::sleep(wait);
+    let frames = Arc::new(Latest::default());
+    let stop = Arc::new(Lifetime::default());
+    let worker = {
+        let (frames, stop, expected) = (frames.clone(), stop.clone(), expected.clone());
+        thread::spawn(move || {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    // Native capture resources stay on their creating thread for the entire session.
+                    let mut capture = capture::VideoCapture::new(settings.width, settings.quality)?;
+                    let interval = Duration::from_secs_f64(1.0 / f64::from(settings.fps));
+                    while !stop.stopped() {
+                        let started = Instant::now();
+                        let actual = capture.display()?;
+                        ensure!(
+                            actual.width == expected.width
+                                && actual.height == expected.height
+                                && actual.x == expected.x
+                                && actual.y == expected.y,
+                            "Display changed. Restart sharing."
+                        );
+                        let bytes = capture.frame()?.to_vec();
+                        ensure!(
+                            !bytes.is_empty() && bytes.len() < MAX_FRAME,
+                            "Capture frame exceeds limit"
+                        );
+                        if !frames.publish(bytes) {
+                            break;
+                        }
+                        // Pace from this capture, never catch up in bursts after a slow capture.
+                        while !stop.stopped() && started.elapsed() < interval {
+                            thread::sleep(
+                                interval
+                                    .saturating_sub(started.elapsed())
+                                    .min(Duration::from_millis(4)),
+                            );
+                        }
+                    }
+                    Ok(())
+                }));
+            let error = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(format!("Screen capture: {e:#}")),
+                Err(_) => Some("Screen capture worker panicked".into()),
+            };
+            frames.close(error);
+        })
+    };
+    let result = (|| -> Result<()> {
+        while !session.life.stopped() {
+            let bytes = match frames.take(&session.life) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => break,
+                Err(error) => {
+                    // Emit errors only at a clean packet boundary, never after a partial JPEG write.
+                    stream.sock.renew();
+                    write_frame_error(stream, &format!("{error:#}"))?;
+                    stream.sock.renew();
+                    let _ = read_json::<bool>(stream);
+                    return Err(error);
+                }
+            };
+            stream.sock.renew();
+            write_frame(stream, &bytes)?;
+            stream.sock.renew();
+            ensure!(read_json::<bool>(stream)?, "Invalid frame request");
         }
-        let actual = capture.display()?;
-        ensure!(
-            actual.width == expected.width
-                && actual.height == expected.height
-                && actual.x == expected.x
-                && actual.y == expected.y,
-            "Display changed. Restart sharing."
-        );
-        ensure!(!session.life.stopped(), "Session stopped");
-        let started = Instant::now();
-        let bytes = capture.frame()?;
-        write_frame(stream, bytes)?;
-        next = started + interval;
-        stream.sock.renew();
-        ensure!(read_json::<bool>(stream)?, "Invalid frame request");
-    }
-    Ok(())
+        Ok(())
+    })();
+    stop.stop();
+    frames.close(None);
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("Capture worker panicked"))?;
+    result
 }
 
 #[cfg(test)]

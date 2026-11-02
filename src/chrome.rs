@@ -211,11 +211,18 @@ mod win {
         data: usize,
     ) -> LRESULT {
         if message == WM_NCDESTROY {
+            crate::keyboard::focus_lost(hwnd as usize);
             unsafe {
                 RemoveWindowSubclass(hwnd, Some(procedure), SUBCLASS);
                 drop(Box::from_raw(data as *mut Arc<Mutex<HitRegions>>));
             }
             return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+        }
+        if message == WM_KILLFOCUS
+            || (message == WM_ACTIVATEAPP && wparam == 0)
+            || (message == WM_ACTIVATE && wparam & 0xffff == 0)
+        {
+            crate::keyboard::focus_lost(hwnd as usize);
         }
         if message == WM_NCCALCSIZE && wparam != 0 {
             if unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32 & WS_CAPTION == 0 {

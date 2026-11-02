@@ -167,7 +167,7 @@ impl VideoCapture {
                         .ok_or_else(|| anyhow::anyhow!("Invalid captured frame"))?;
                     let resized = DynamicImage::ImageRgba8(image)
                         .resize(self.width, 2160, FilterType::Triangle)
-                        .to_rgba8();
+                        .into_rgba8();
                     self.compressor.compress(
                         turbojpeg::Image {
                             pixels: &resized,
@@ -208,7 +208,7 @@ impl VideoCapture {
         } else {
             image
         };
-        let rgba = image.to_rgba8();
+        let rgba = image.into_rgba8();
         self.compressor.compress(
             turbojpeg::Image {
                 pixels: &rgba,

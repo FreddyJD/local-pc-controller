@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 pub const MAX_PREVIEW: usize = 256 * 1024;
 pub const PREVIEW_WIDTH: u32 = 480;
 pub const PREVIEW_HEIGHT: u32 = 270;
@@ -13,6 +13,15 @@ pub const MAX_JSON: usize = 16 * 1024;
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS: usize = 64;
 pub const SERVER_NAME: &str = "localnet.local";
+
+#[derive(Debug)]
+pub struct RemoteVideoError(String);
+impl std::fmt::Display for RemoteVideoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Remote video: {}", self.0)
+    }
+}
+impl std::error::Error for RemoteVideoError {}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RemoteError {
@@ -123,6 +132,7 @@ pub struct Modifiers {
     pub control: bool,
     pub alt: bool,
     pub shift: bool,
+    pub meta: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -202,7 +212,7 @@ pub fn read_frame(reader: &mut impl Read) -> Result<Vec<u8>> {
         }
         1 => {
             ensure!(packet.len() < MAX_JSON, "Invalid error packet");
-            bail!("Remote video: {}", std::str::from_utf8(&packet)?);
+            Err(RemoteVideoError(std::str::from_utf8(&packet)?.to_owned()).into())
         }
         _ => bail!("Unknown video packet. Update Localnet on both computers."),
     }
@@ -254,6 +264,8 @@ mod tests {
                 .contains("Screen Recording")
         );
         assert!(read_frame(&mut Cursor::new([0, 0, 0, 1, 0])).is_err());
+        let error = read_frame(&mut Cursor::new([0, 0, 0, 3, 0, 1])).unwrap_err();
+        assert!(!error.is::<RemoteVideoError>());
     }
 
     #[test]
