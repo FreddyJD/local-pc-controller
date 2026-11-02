@@ -590,6 +590,7 @@ impl Localnet {
                 ui.small(if host.sharing { "Screen sharing is active" } else { "Ready for incoming connections" });
                 ui.label(&host.status);
                 drop(host);
+                if ui.button("Refresh nearby computers").clicked() { discovery.refresh_nearby(); }
                 if ui.button("Disable local access").clicked() { self.discovery.take(); }
             } else if ui.button("Enable local access").clicked() { self.previews.get_or_insert_with(Previews::new); self.enable_discovery(); }
             ui.separator();
@@ -915,6 +916,18 @@ impl eframe::App for Localnet {
             .as_ref()
             .and_then(|outgoing| outgoing.state.lock().unwrap().result.take());
         if let Some(result) = result {
+            if self
+                .outgoing
+                .as_ref()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .refresh_discovery
+                && let Some(discovery) = &self.discovery
+            {
+                discovery.refresh_nearby();
+            }
             let name = self.outgoing.as_ref().unwrap().device.name.clone();
             self.outgoing.take();
             match result.and_then(|pair| {

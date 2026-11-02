@@ -66,6 +66,7 @@ impl Device {
 pub struct DiscoveryState {
     pub devices: HashMap<String, Device>,
     pub status: String,
+    refresh_requested: bool,
 }
 
 pub struct Discovery {
@@ -187,7 +188,7 @@ impl Discovery {
             }
             Ok((fullname, daemon.browse(SERVICE)?))
         })();
-        let (fullname, events) = match setup {
+        let (fullname, mut events) = match setup {
             Ok(value) => value,
             Err(e) => {
                 let _ = daemon.shutdown();
@@ -206,6 +207,7 @@ impl Discovery {
             ..Default::default()
         }));
         let worker = {
+            let daemon = daemon.clone();
             let (life, state, own, controller) = (
                 life.clone(),
                 state.clone(),
@@ -215,6 +217,29 @@ impl Discovery {
             thread::spawn(move || {
                 let mut workers: Vec<(JoinHandle<()>, Arc<Lifetime>)> = Vec::new();
                 while !life.stopped() {
+                    let refresh = std::mem::take(&mut state.lock().unwrap().refresh_requested);
+                    if refresh {
+                        match daemon
+                            .stop_browse(SERVICE)
+                            .and_then(|()| daemon.browse(SERVICE))
+                        {
+                            Ok(receiver) => {
+                                events = receiver;
+                                let mut state = state.lock().unwrap();
+                                state.devices.clear();
+                                state.status = format!(
+                                    "Local access enabled on {ip}. Nearby computers refreshed; click a computer to connect."
+                                );
+                            }
+                            Err(e) => {
+                                state.lock().unwrap().status = format!(
+                                    "Discovery refresh failed: {e}. Disable and enable local access to retry."
+                                );
+                                life.stop();
+                                break;
+                            }
+                        }
+                    }
                     for _ in 0..128 {
                         match events.try_recv() {
                             Ok(ServiceEvent::ServiceResolved(service))
@@ -227,11 +252,7 @@ impl Discovery {
                                         continue;
                                     }
                                     let mut state = state.lock().unwrap();
-                                    if state.devices.contains_key(service.get_fullname())
-                                        || state.devices.len() < MAX_DEVICES
-                                    {
-                                        state.devices.insert(service.get_fullname().into(), device);
-                                    }
+                                    state.resolved(service.get_fullname(), device);
                                 }
                             }
                             Ok(ServiceEvent::ServiceRemoved(_, name)) => {
@@ -314,6 +335,23 @@ impl Discovery {
             fullname,
             worker: Some(worker),
         })
+    }
+
+    pub fn refresh_nearby(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.devices.clear();
+        state.status = "Refreshing nearby computers and their TLS identities...".into();
+        state.refresh_requested = true;
+    }
+}
+
+impl DiscoveryState {
+    fn resolved(&mut self, fullname: &str, device: Device) {
+        // A restarted app has a new service name and key at the same endpoint.
+        self.devices.retain(|_, old| old.address != device.address);
+        if self.devices.contains_key(fullname) || self.devices.len() < MAX_DEVICES {
+            self.devices.insert(fullname.into(), device);
+        }
     }
 }
 
@@ -476,6 +514,7 @@ pub struct Outgoing {
 pub struct OutgoingState {
     pub status: String,
     pub result: Option<Result<SessionTicket, String>>,
+    pub refresh_discovery: bool,
 }
 
 impl Outgoing {
@@ -488,9 +527,18 @@ impl Outgoing {
         let worker = {
             let (state, life, device) = (state.clone(), life.clone(), device.clone());
             thread::spawn(move || {
-                let result = outgoing(&device, &state, &life)
-                    .map_err(|e| format!("{} ({}): {e:#}", device.name, device.address.ip()));
-                state.lock().unwrap().result = Some(result);
+                let result = outgoing(&device, &state, &life);
+                let refresh = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(transport::is_certificate_error);
+                let result =
+                    result.map_err(|e| format!("{} ({}): {e:#}", device.name, device.address.ip()));
+                {
+                    let mut state = state.lock().unwrap();
+                    state.refresh_discovery = refresh;
+                    state.result = Some(result);
+                }
                 life.stop();
             })
         };
@@ -529,7 +577,13 @@ fn outgoing(
         token: String::new(),
     };
     let mut stream = transport::connect(&provisional, transport::client_config(&provisional)?, life)
-        .context("Connecting to discovery TLS on port 45778; check the remote app, firewall, and that both computers use the same build")?;
+        .map_err(|error| {
+            if transport::is_certificate_error(&error) {
+                error.context("TLS identity verification failed; the discovered certificate may be stale after an app restart. Refresh nearby computers and retry. The connection was rejected, not a screen permission failure")
+            } else {
+                error.context("Connecting to discovery TLS on port 45778; check the remote app, firewall, and that both computers use the same build")
+            }
+        })?;
     stream.sock.renew();
     protocol::write_json(
         &mut stream,
@@ -686,6 +740,7 @@ mod tests {
         .unwrap();
         let found = device(&service.as_resolved_service()).unwrap();
         assert_eq!(found.name, "Office PC");
+        assert_eq!(found.certificate, certificate);
         assert!(!found.compatible());
         let service = ServiceInfo::new(
             SERVICE,
@@ -708,6 +763,78 @@ mod tests {
         )
         .unwrap();
         assert!(device(&service.as_resolved_service()).is_err());
+    }
+
+    #[test]
+    fn restarted_device_replaces_its_old_endpoint_identity() {
+        let (_, old_certificate) = identity().unwrap();
+        let (_, new_certificate) = identity().unwrap();
+        let mut state = DiscoveryState::default();
+        for (name, certificate) in [("old", old_certificate), ("new", new_certificate.clone())] {
+            state.resolved(
+                name,
+                Device {
+                    name: "Mac".into(),
+                    address: "192.168.1.20:45778".parse().unwrap(),
+                    certificate,
+                    version: protocol::VERSION,
+                },
+            );
+        }
+        assert_eq!(state.devices.len(), 1);
+        assert_eq!(state.devices["new"].certificate, new_certificate);
+        state.devices.remove("old");
+        assert_eq!(state.devices.len(), 1);
+    }
+
+    #[test]
+    fn stale_identity_is_rejected_and_fresh_discovery_recovers() {
+        let (config, certificate) = identity().unwrap();
+        let (_, stale_certificate) = identity().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut device = Device {
+            name: "Restarted Mac".into(),
+            address: listener.local_addr().unwrap(),
+            certificate: stale_certificate,
+            version: protocol::VERSION,
+        };
+        let server = thread::spawn(move || {
+            for stale in [true, false] {
+                let result = incoming(
+                    listener.accept().unwrap().0,
+                    "127.0.0.1".parse().unwrap(),
+                    config.clone(),
+                    &Arc::new(Lifetime::default()),
+                    &PreviewCache::default(),
+                    |_, _| Err(RemoteError::new("busy", "Fresh identity verified")),
+                );
+                assert_eq!(result.is_err(), stale);
+            }
+        });
+        for stale in [true, false] {
+            if !stale {
+                device.certificate = certificate.clone();
+            }
+            let outgoing = Outgoing::start(device.clone());
+            let until = Instant::now() + Duration::from_secs(5);
+            let error = loop {
+                if let Some(result) = outgoing.state.lock().unwrap().result.take() {
+                    break result.err().unwrap();
+                }
+                assert!(Instant::now() < until);
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(outgoing.state.lock().unwrap().refresh_discovery, stale);
+            if stale {
+                assert!(
+                    error.contains("BadSignature") && error.contains("Refresh nearby computers"),
+                    "{error}"
+                );
+            } else {
+                assert!(error.contains("Fresh identity verified"), "{error}");
+            }
+        }
+        server.join().unwrap();
     }
 
     #[test]
@@ -935,6 +1062,23 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(discovery.state.lock().unwrap().devices[&name].compatible());
+        discovery.refresh_nearby();
+        let until = Instant::now() + Duration::from_secs(15);
+        while {
+            let state = discovery.state.lock().unwrap();
+            !state.status.contains("refreshed") || !state.devices.contains_key(&name)
+        } {
+            assert!(!discovery.life.stopped(), "Refresh stopped local access");
+            assert!(
+                Instant::now() < until,
+                "Refresh did not rediscover the service"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            discovery.state.lock().unwrap().devices[&name].certificate,
+            certificate
+        );
         discovery.daemon.unregister(&name).unwrap();
         let until = Instant::now() + Duration::from_secs(10);
         while discovery.state.lock().unwrap().devices.contains_key(&name) {

@@ -64,6 +64,8 @@ The new version starts sharing off the UI thread, returns explicit permission/st
 
 If the Mac still closes a connection, check the stage in the Windows error and the Mac's Localnet status in Settings. Confirm both copies are 0.3.0, close duplicate instances, grant OS permissions, and verify the firewall and selected interface. Native screen-capture calls are not cancellable by socket shutdown and can still block shutdown until the OS call returns. Unclaimed internal session tickets expire after 30 seconds; canceled startup results are discarded.
 
+If connecting reports `invalid peer certificate: BadSignature` after the other app restarts, the discovered TLS certificate may be stale. Update the connecting computer, click **Refresh nearby computers**, then retry after the computer reappears. Certificate failures also trigger rediscovery automatically; the failed connection remains rejected. This is separate from Screen Recording or Accessibility permission. Refresh does not stop local sharing or disconnect existing viewers.
+
 ## Video and Input
 
 - Windows uses persistent native DXGI Desktop Duplication with a reusable staging texture and screenshot fallback. Mac still uses xcap's deprecated screenshot API, not ScreenCaptureKit.

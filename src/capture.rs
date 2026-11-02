@@ -237,7 +237,7 @@ fn pack_bgra(bytes: &[u8], width: u32, height: u32, pitch: usize) -> Result<Vec<
     );
     let mut rgba = Vec::with_capacity(row * height as usize);
     for line in bytes.chunks(pitch).take(height as usize) {
-        for pixel in line[..row].chunks_exact(4) {
+        for pixel in line[..row].as_chunks::<4>().0 {
             rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
         }
     }
