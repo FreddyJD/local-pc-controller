@@ -236,7 +236,7 @@ impl Localnet {
     fn connect_device(&mut self, device: Device) {
         if !device.compatible() {
             self.error = format!(
-                "Update Localnet on {} and this computer to 0.4.0 for the video and keyboard fixes.",
+                "Update Localnet on {} and this computer to 0.4.1 for the video timeout fix.",
                 device.name
             );
             return;
@@ -667,6 +667,7 @@ impl Localnet {
                     ui.monospace(format!("Received: {:.1} FPS / Decoded: {:.1} FPS",state.received_fps,state.decoded_fps));
                     ui.monospace(format!("Receive wait: {:.1} ms / Decode: {:.1} ms",state.receive_ms,state.decode_ms));
                     ui.monospace(format!("Input ACK: {:.1} ms",state.input_rtt_ms));
+                    ui.monospace(format!("Capture pending: {:.1} s / Heartbeats: {}",state.capture_wait_ms/1000.0,state.video_heartbeats));
                     ui.monospace(format!("Replaced before decode: {} / Before UI: {}",state.compressed_replaced,state.decoded_replaced));
                     ui.monospace(format!("UI texture updates: {} / Decoded-to-UI: {:.1} ms",self.sessions[index].uploads,self.sessions[index].upload_age_ms));
                     ui.small("Receive time includes waiting for the host. FPS counts frames, including static repeats. These are not input-to-photon or display-present timings.");
@@ -761,7 +762,7 @@ impl Localnet {
                                 );
                             } else {
                                 let label = if !device.compatible() {
-                                    "Update Localnet to 0.4.0"
+                                    "Update Localnet to 0.4.1"
                                 } else if self
                                     .previews
                                     .as_ref()
@@ -914,6 +915,15 @@ impl Localnet {
                         ui.label(message);
                     });
             });
+        } else {
+            let waiting = session.viewer.state.lock().unwrap().capture_wait_ms;
+            if waiting >= 1000.0 {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(area.shrink(24.0)), |ui| {
+                    egui::Frame::new().fill(Color32::from_rgb(35,32,24)).inner_margin(12.0).corner_radius(6).show(ui, |ui| {
+                        ui.label(format!("Waiting for the remote screen capture ({:.1}s). The image below is the last received frame.", waiting/1000.0));
+                    });
+                });
+            }
         }
         ui.allocate_rect(area, egui::Sense::hover());
     }

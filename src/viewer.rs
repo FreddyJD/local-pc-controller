@@ -28,6 +28,8 @@ pub struct ViewerState {
     pub decoded_at: Option<Instant>,
     pub received_fps: f64,
     pub decoded_fps: f64,
+    pub video_heartbeats: u64,
+    pub capture_wait_ms: f64,
 }
 
 #[derive(Default)]
@@ -248,13 +250,33 @@ fn session(
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                     let mut rate = (Instant::now(), 0_u64);
+                    let mut last_frame = Instant::now();
                     video.sock.renew();
                     write_json(&mut video, &true)?;
                     while !life.stopped() {
                         let start = Instant::now();
                         video.sock.renew();
                         let bytes = match read_frame(&mut video) {
-                            Ok(bytes) => bytes,
+                            Ok(Some(bytes)) => bytes,
+                            Ok(None) => {
+                                let wait = last_frame.elapsed();
+                                {
+                                    let mut state = state.lock().unwrap();
+                                    state.video_heartbeats += 1;
+                                    state.capture_wait_ms = wait.as_secs_f64() * 1000.0;
+                                    if wait >= Duration::from_secs(1) {
+                                        state.status =
+                                            "Connected. Waiting for the remote screen capture..."
+                                                .into();
+                                        state.received_fps = 0.0;
+                                        state.decoded_fps = 0.0;
+                                    }
+                                }
+                                video.sock.renew();
+                                write_json(&mut video, &true)?;
+                                ctx.request_repaint();
+                                continue;
+                            }
                             Err(error) => {
                                 first_error
                                     .lock()
@@ -271,9 +293,13 @@ fn session(
                         if !compressed.publish(bytes) {
                             break;
                         }
+                        last_frame = Instant::now();
+                        video.sock.renew();
                         write_json(&mut video, &true)?;
                         let mut state = state.lock().unwrap();
                         state.received += 1;
+                        state.capture_wait_ms = 0.0;
+                        state.status = "Connected. Click the remote screen to take control.".into();
                         state.receive_ms = start.elapsed().as_secs_f64() * 1000.0;
                         state.frame_roundtrip_ms = state.receive_ms;
                         state.compressed_replaced = compressed.replaced();
@@ -504,6 +530,128 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn viewer_keeps_input_alive_through_video_idle_and_resumes_decoding() {
+        use rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
+        use std::{
+            net::TcpListener,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+        let identity = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into()]).unwrap();
+        let config = Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![identity.cert.der().clone()],
+                    PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
+                )
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ticket = SessionTicket {
+            version: VERSION,
+            address: listener.local_addr().unwrap(),
+            certificate: identity.cert.der().to_vec(),
+            token: "a".repeat(64),
+        };
+        let input_acks = Arc::new(AtomicU64::new(0));
+        let acks = input_acks.clone();
+        let server = thread::spawn(move || {
+            let mut control =
+                transport::accept(listener.accept().unwrap().0, config.clone()).unwrap();
+            let _: Hello = read_json(&mut control).unwrap();
+            write_json(
+                &mut control,
+                &Ok::<_, String>(Welcome {
+                    session: "b".repeat(64),
+                    display: DisplayInfo {
+                        name: "Slow Mac".into(),
+                        mac: true,
+                        x: 0,
+                        y: 0,
+                        width: 1920,
+                        height: 1080,
+                    },
+                }),
+            )
+            .unwrap();
+            let control_worker = thread::spawn(move || {
+                loop {
+                    control.sock.renew();
+                    if read_json::<Vec<Input>>(&mut control).is_err() {
+                        break;
+                    }
+                    if write_json(&mut control, &Ok::<(), String>(())).is_err() {
+                        break;
+                    }
+                    acks.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            let mut video = transport::accept(listener.accept().unwrap().0, config).unwrap();
+            let _: Hello = read_json(&mut video).unwrap();
+            assert!(read_json::<bool>(&mut video).unwrap());
+            for _ in 0..15 {
+                thread::sleep(Duration::from_millis(250));
+                video.sock.renew();
+                write_frame_pending(&mut video).unwrap();
+                assert!(read_json::<bool>(&mut video).unwrap());
+            }
+            let rgb = image::RgbImage::from_pixel(8, 4, image::Rgb([25, 45, 80]));
+            let mut bytes = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+                .encode_image(&rgb)
+                .unwrap();
+            for _ in 0..4 {
+                video.sock.renew();
+                write_frame(&mut video, &bytes).unwrap();
+                assert!(read_json::<bool>(&mut video).unwrap());
+            }
+            video.sock.renew();
+            while read_json::<bool>(&mut video).is_ok() {}
+            control_worker.join().unwrap();
+        });
+        let viewer = Viewer::start(ticket, egui::Context::default());
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = viewer.state.lock().unwrap();
+            if state.video_heartbeats >= 13 {
+                assert_eq!(state.received, 0);
+                assert_eq!(state.frames, 0);
+                assert!(state.capture_wait_ms >= 3000.0);
+                assert!(state.status.contains("Waiting for the remote screen"));
+                break;
+            }
+            drop(state);
+            assert!(viewer.connected());
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(10));
+        }
+        while viewer.state.lock().unwrap().frames == 0 {
+            assert!(
+                viewer.connected(),
+                "{}",
+                viewer.state.lock().unwrap().status
+            );
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(input_acks.load(Ordering::Relaxed) >= 8);
+        assert!(
+            viewer
+                .state
+                .lock()
+                .unwrap()
+                .status
+                .starts_with("Connected. Click")
+        );
+        assert_eq!(viewer.state.lock().unwrap().capture_wait_ms, 0.0);
+        viewer.stop();
+        drop(viewer);
         server.join().unwrap();
     }
 

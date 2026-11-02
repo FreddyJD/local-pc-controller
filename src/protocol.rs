@@ -1,11 +1,11 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     io::{Read, Write},
     net::{IpAddr, SocketAddr},
 };
 
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 pub const MAX_PREVIEW: usize = 256 * 1024;
 pub const PREVIEW_WIDTH: u32 = 480;
 pub const PREVIEW_HEIGHT: u32 = 270;
@@ -167,13 +167,17 @@ pub fn write_packet(writer: &mut impl Write, bytes: &[u8], max: usize) -> Result
 
 pub fn read_packet(reader: &mut impl Read, max: usize) -> Result<Vec<u8>> {
     let mut length = [0_u8; 4];
-    reader.read_exact(&mut length)?;
+    reader
+        .read_exact(&mut length)
+        .context("Reading packet header")?;
     let length = u32::from_be_bytes(length) as usize;
     if length == 0 || length > max {
         bail!("Invalid packet length: {length}");
     }
     let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes)?;
+    reader
+        .read_exact(&mut bytes)
+        .with_context(|| format!("Reading packet payload ({length} bytes)"))?;
     Ok(bytes)
 }
 
@@ -203,16 +207,25 @@ pub fn write_frame_error(writer: &mut impl Write, error: &str) -> Result<()> {
     write_packet(writer, &bytes, MAX_JSON)
 }
 
-pub fn read_frame(reader: &mut impl Read) -> Result<Vec<u8>> {
+pub fn write_frame_pending(writer: &mut impl Write) -> Result<()> {
+    write_packet(writer, &[2], MAX_FRAME)
+}
+
+// None is a complete capture-pending packet, never a transport timeout or a repeated image.
+pub fn read_frame(reader: &mut impl Read) -> Result<Option<Vec<u8>>> {
     let mut packet = read_packet(reader, MAX_FRAME)?;
     match packet.remove(0) {
         0 => {
             ensure!(!packet.is_empty(), "Empty frame");
-            Ok(packet)
+            Ok(Some(packet))
         }
         1 => {
             ensure!(packet.len() < MAX_JSON, "Invalid error packet");
             Err(RemoteVideoError(std::str::from_utf8(&packet)?.to_owned()).into())
+        }
+        2 => {
+            ensure!(packet.is_empty(), "Invalid capture-pending packet");
+            Ok(None)
         }
         _ => bail!("Unknown video packet. Update Localnet on both computers."),
     }
@@ -254,7 +267,10 @@ mod tests {
     fn frames_carry_remote_errors_without_exposing_decoder_to_json() {
         let mut bytes = Vec::new();
         write_frame(&mut bytes, b"jpeg").unwrap();
-        assert_eq!(read_frame(&mut Cursor::new(bytes)).unwrap(), b"jpeg");
+        assert_eq!(
+            read_frame(&mut Cursor::new(bytes)).unwrap(),
+            Some(b"jpeg".to_vec())
+        );
         let mut bytes = Vec::new();
         write_frame_error(&mut bytes, "Screen Recording permission required").unwrap();
         assert!(
@@ -265,6 +281,25 @@ mod tests {
         );
         assert!(read_frame(&mut Cursor::new([0, 0, 0, 1, 0])).is_err());
         let error = read_frame(&mut Cursor::new([0, 0, 0, 3, 0, 1])).unwrap_err();
+        assert!(!error.is::<RemoteVideoError>());
+    }
+
+    #[test]
+    fn pending_packets_preserve_framing_and_reject_malformed_or_partial_packets() {
+        let mut bytes = Vec::new();
+        write_frame_pending(&mut bytes).unwrap();
+        write_frame(&mut bytes, b"next frame").unwrap();
+        write_frame_pending(&mut bytes).unwrap();
+        let mut reader = Cursor::new(bytes);
+        assert_eq!(read_frame(&mut reader).unwrap(), None);
+        assert_eq!(
+            read_frame(&mut reader).unwrap(),
+            Some(b"next frame".to_vec())
+        );
+        assert_eq!(read_frame(&mut reader).unwrap(), None);
+        assert!(read_frame(&mut Cursor::new([0, 0, 0, 2, 2, 99])).is_err());
+        let error = read_frame(&mut Cursor::new([0, 0, 0, 2, 2])).unwrap_err();
+        assert!(error.to_string().contains("payload"));
         assert!(!error.is::<RemoteVideoError>());
     }
 

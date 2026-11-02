@@ -156,6 +156,56 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_video_packet_times_out_without_becoming_a_capture_heartbeat() {
+        use crate::protocol::{RemoteVideoError, read_frame};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        let identity = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into()]).unwrap();
+        let config = Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![identity.cert.der().clone()],
+                    PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
+                )
+                .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ticket = SessionTicket {
+            version: crate::protocol::VERSION,
+            address: listener.local_addr().unwrap(),
+            certificate: identity.cert.der().to_vec(),
+            token: "a".repeat(64),
+        };
+        let (stop, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let mut stream = accept(listener.accept().unwrap().0, config).unwrap();
+            // A declared five-byte frame is truncated after its tag and one data byte.
+            stream.write_all(&[0, 0, 0, 5, 0, 99]).unwrap();
+            stream.flush().unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(8));
+        });
+        let life = Lifetime::default();
+        let mut stream = connect(&ticket, client_config(&ticket).unwrap(), &life).unwrap();
+        stream.sock.renew();
+        let error = read_frame(&mut stream).unwrap_err();
+        assert!(error.to_string().contains("payload (5 bytes)"));
+        assert!(!error.is::<RemoteVideoError>());
+        assert!(
+            error
+                .chain()
+                .any(|e| e.downcast_ref::<io::Error>().is_some_and(|e| matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                )))
+        );
+        life.stop();
+        stop.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn tls_verifies_discovered_certificate_and_rejects_another_host() {
         use crate::protocol::{VERSION, read_json, write_json};
         use rustls::pki_types::PrivatePkcs8KeyDer;

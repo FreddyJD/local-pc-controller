@@ -1,7 +1,7 @@
 use crate::{
     capture,
     input::InputDevice,
-    latest::Latest,
+    latest::{Latest, Poll},
     protocol::*,
     transport::{self, Lifetime, ServerStream},
 };
@@ -18,6 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
+
+const VIDEO_HEARTBEAT: Duration = Duration::from_millis(250);
+const CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy)]
 pub struct VideoSettings {
@@ -601,27 +604,12 @@ fn video(
             frames.close(error);
         })
     };
-    let result = (|| -> Result<()> {
-        while !session.life.stopped() {
-            let bytes = match frames.take(&session.life) {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => break,
-                Err(error) => {
-                    // Emit errors only at a clean packet boundary, never after a partial JPEG write.
-                    stream.sock.renew();
-                    write_frame_error(stream, &format!("{error:#}"))?;
-                    stream.sock.renew();
-                    let _ = read_json::<bool>(stream);
-                    return Err(error);
-                }
-            };
-            stream.sock.renew();
-            write_frame(stream, &bytes)?;
-            stream.sock.renew();
-            ensure!(read_json::<bool>(stream)?, "Invalid frame request");
-        }
-        Ok(())
-    })();
+    let result = send_video_frames(stream, &session.life, &frames, CAPTURE_STALL_TIMEOUT);
+    if let Err(error) = &result {
+        *session.error.lock().unwrap() = Some(format!("{error:#}"));
+    }
+    // Release remote input even if the native OS capture call is still blocked during cleanup.
+    session.life.stop();
     stop.stop();
     frames.close(None);
     worker
@@ -630,9 +618,185 @@ fn video(
     result
 }
 
+fn send_video_frames(
+    stream: &mut ServerStream,
+    life: &Lifetime,
+    frames: &Latest<Vec<u8>>,
+    stall_timeout: Duration,
+) -> Result<()> {
+    let mut last_frame = Instant::now();
+    while !life.stopped() {
+        let pending = match frames.poll(life, VIDEO_HEARTBEAT) {
+            Ok(Poll::Closed) => return Ok(()),
+            Ok(Poll::Frame(bytes)) => {
+                stream.sock.renew();
+                write_frame(stream, &bytes).context("Sending video frame")?;
+                last_frame = Instant::now();
+                false
+            }
+            Ok(Poll::Pending) if last_frame.elapsed() < stall_timeout => {
+                stream.sock.renew();
+                write_frame_pending(stream).context("Sending capture heartbeat")?;
+                true
+            }
+            result => {
+                let error = match result {
+                    Err(error) => error,
+                    _ => anyhow::anyhow!(
+                        "Screen capture produced no frame for {} seconds. Check whether the remote computer is awake and unlocked, and whether Localnet still has Screen Recording permission. Disconnect and retry.",
+                        stall_timeout.as_secs()
+                    ),
+                };
+                // Only mailbox failures reach here; transport errors never append data to a partial packet.
+                stream.sock.renew();
+                write_frame_error(stream, &format!("{error:#}"))?;
+                stream.sock.renew();
+                let _ = read_json::<bool>(stream);
+                return Err(error);
+            }
+        };
+        stream.sock.renew();
+        ensure!(
+            read_json::<bool>(stream).with_context(|| if pending {
+                "Waiting for capture-heartbeat acknowledgment"
+            } else {
+                "Waiting for frame acknowledgment"
+            })?,
+            "Invalid frame request"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn video_test_listener() -> (TcpListener, Arc<ServerConfig>, SessionTicket) {
+        let identity = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into()]).unwrap();
+        let config = Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![identity.cert.der().clone()],
+                    PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
+                )
+                .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ticket = SessionTicket {
+            version: VERSION,
+            address: listener.local_addr().unwrap(),
+            certificate: identity.cert.der().to_vec(),
+            token: "a".repeat(64),
+        };
+        (listener, config, ticket)
+    }
+
+    #[test]
+    fn delayed_capture_stays_connected_beyond_packet_timeout_and_resumes_frames() {
+        let (listener, config, ticket) = video_test_listener();
+        let frames = Arc::new(Latest::default());
+        let server_frames = frames.clone();
+        let life = Arc::new(Lifetime::default());
+        let server_life = life.clone();
+        let server = thread::spawn(move || {
+            let socket = listener.accept().unwrap().0;
+            server_life.track(&socket).unwrap();
+            let mut stream = transport::accept(socket, config).unwrap();
+            assert!(read_json::<bool>(&mut stream).unwrap());
+            send_video_frames(
+                &mut stream,
+                &server_life,
+                &server_frames,
+                Duration::from_secs(15),
+            )
+        });
+        let client_life = Lifetime::default();
+        let mut stream = transport::connect(
+            &ticket,
+            transport::client_config(&ticket).unwrap(),
+            &client_life,
+        )
+        .unwrap();
+        write_json(&mut stream, &true).unwrap();
+        let began = Instant::now();
+        let mut heartbeats = 0;
+        while began.elapsed() < Duration::from_millis(3300) {
+            stream.sock.renew();
+            assert!(read_frame(&mut stream).unwrap().is_none());
+            write_json(&mut stream, &true).unwrap();
+            heartbeats += 1;
+        }
+        assert!(heartbeats >= 10);
+        for value in [b"first frame".as_slice(), b"second frame".as_slice()] {
+            assert!(frames.publish(value.to_vec()));
+            loop {
+                stream.sock.renew();
+                let packet = read_frame(&mut stream).unwrap();
+                write_json(&mut stream, &true).unwrap();
+                if let Some(frame) = packet {
+                    assert_eq!(frame, value);
+                    break;
+                }
+            }
+        }
+        life.stop();
+        frames.close(None);
+        assert!(server.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn capture_stall_becomes_readable_error_and_missing_peer_ack_still_times_out() {
+        for acknowledge in [true, false] {
+            let (listener, config, ticket) = video_test_listener();
+            let server = thread::spawn(move || {
+                let mut stream = transport::accept(listener.accept().unwrap().0, config).unwrap();
+                assert!(read_json::<bool>(&mut stream).unwrap());
+                send_video_frames(
+                    &mut stream,
+                    &Lifetime::default(),
+                    &Latest::default(),
+                    Duration::from_millis(600),
+                )
+            });
+            let mut stream = transport::connect(
+                &ticket,
+                transport::client_config(&ticket).unwrap(),
+                &Lifetime::default(),
+            )
+            .unwrap();
+            write_json(&mut stream, &true).unwrap();
+            if acknowledge {
+                loop {
+                    stream.sock.renew();
+                    let packet = read_frame(&mut stream);
+                    write_json(&mut stream, &true).unwrap();
+                    match packet {
+                        Ok(None) => {}
+                        Err(error) => {
+                            assert!(error.is::<RemoteVideoError>());
+                            assert!(
+                                error
+                                    .to_string()
+                                    .contains("Screen capture produced no frame")
+                            );
+                            break;
+                        }
+                        _ => panic!("Unexpected JPEG"),
+                    }
+                }
+            }
+            let error = server.join().unwrap().unwrap_err();
+            assert!(error.to_string().contains(if acknowledge {
+                "Screen capture produced no frame"
+            } else {
+                "capture-heartbeat acknowledgment"
+            }));
+        }
+    }
     fn permission_failure(_: IpAddr, _: IpAddr, _: VideoSettings) -> Result<Host> {
         anyhow::bail!("Enable Screen Recording and Accessibility for Localnet on Mac")
     }

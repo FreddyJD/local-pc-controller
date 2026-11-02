@@ -2,7 +2,7 @@ use crate::transport::Lifetime;
 use anyhow::Result;
 use std::{
     sync::{Condvar, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct State<T> {
@@ -15,6 +15,12 @@ struct State<T> {
 pub struct Latest<T> {
     state: Mutex<State<T>>,
     wake: Condvar,
+}
+
+pub enum Poll<T> {
+    Frame(T),
+    Pending,
+    Closed,
 }
 
 impl<T> Default for Latest<T> {
@@ -48,21 +54,36 @@ impl<T> Latest<T> {
     }
 
     pub fn take(&self, life: &Lifetime) -> Result<Option<T>> {
+        loop {
+            match self.poll(life, Duration::from_millis(50))? {
+                Poll::Frame(frame) => return Ok(Some(frame)),
+                Poll::Closed => return Ok(None),
+                Poll::Pending => {}
+            }
+        }
+    }
+
+    pub fn poll(&self, life: &Lifetime, timeout: Duration) -> Result<Poll<T>> {
+        let deadline = Instant::now() + timeout;
         let mut state = self.state.lock().unwrap();
         loop {
             if let Some(error) = &state.error {
                 anyhow::bail!("{error}");
             }
             if state.closed || life.stopped() {
-                return Ok(None);
+                return Ok(Poll::Closed);
             }
             if let Some(value) = state.pending.take() {
-                return Ok(Some(value));
+                return Ok(Poll::Frame(value));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(Poll::Pending);
             }
             // Socket cancellation also interrupts a mailbox-only wait within this bounded poll.
             state = self
                 .wake
-                .wait_timeout(state, Duration::from_millis(50))
+                .wait_timeout(state, remaining.min(Duration::from_millis(50)))
                 .unwrap()
                 .0;
         }
@@ -127,6 +148,32 @@ mod tests {
             }
             assert_eq!(waiter.join().unwrap(), None);
         }
+    }
+
+    #[test]
+    fn timed_poll_distinguishes_capture_pending_from_closed_and_error() {
+        let queue = Latest::<u8>::default();
+        let life = Lifetime::default();
+        assert!(matches!(
+            queue.poll(&life, Duration::ZERO).unwrap(),
+            Poll::Pending
+        ));
+        queue.publish(3);
+        assert!(matches!(
+            queue.poll(&life, Duration::ZERO).unwrap(),
+            Poll::Frame(3)
+        ));
+        queue.close(Some("capture failed".into()));
+        assert_eq!(
+            queue.poll(&life, Duration::ZERO).err().unwrap().to_string(),
+            "capture failed"
+        );
+        let queue = Arc::new(Latest::<u8>::default());
+        let life = Arc::new(Lifetime::default());
+        let (q, l) = (queue.clone(), life.clone());
+        let waiter = thread::spawn(move || q.poll(&l, Duration::from_secs(30)).unwrap());
+        life.stop();
+        assert!(matches!(waiter.join().unwrap(), Poll::Closed));
     }
 
     #[test]
