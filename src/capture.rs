@@ -46,6 +46,28 @@ pub fn check_permissions() -> Result<()> {
     permissions(false)
 }
 
+pub fn thumbnail() -> Result<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    ensure!(
+        objc2_core_graphics::CGPreflightScreenCaptureAccess(),
+        "Enable Screen Recording for Localnet on this Mac, then restart it."
+    );
+    let monitor = primary()?;
+    let image = DynamicImage::ImageRgba8(monitor.capture_image()?)
+        .thumbnail(
+            crate::protocol::PREVIEW_WIDTH,
+            crate::protocol::PREVIEW_HEIGHT,
+        )
+        .to_rgb8();
+    let mut bytes = Vec::new();
+    JpegEncoder::new_with_quality(&mut bytes, 65).encode_image(&image)?;
+    ensure!(
+        bytes.len() <= crate::protocol::MAX_PREVIEW,
+        "Screenshot preview exceeds size limit"
+    );
+    Ok(bytes)
+}
+
 fn permissions(prompt: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     if !objc2_core_graphics::CGPreflightScreenCaptureAccess() {

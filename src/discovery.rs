@@ -1,5 +1,6 @@
 use crate::{
     host::{HostController, VideoSettings},
+    preview::PreviewCache,
     protocol::{self, RemoteError, SessionTicket, is_local},
     transport::{self, Lifetime},
 };
@@ -195,6 +196,11 @@ impl Discovery {
         };
         let life = Arc::new(Lifetime::default());
         let controller = Arc::new(HostController::start(ip, settings));
+        let previews = Arc::new(PreviewCache::default());
+        let local_ips: Vec<_> = if_addrs::get_if_addrs()?
+            .into_iter()
+            .map(|interface| interface.ip())
+            .collect();
         let state = Arc::new(Mutex::new(DiscoveryState {
             status: format!("Local access enabled on {ip}. Click a computer to connect."),
             ..Default::default()
@@ -215,6 +221,11 @@ impl Discovery {
                                 if service.get_fullname() != own =>
                             {
                                 if let Ok(device) = device(&service) {
+                                    if (advertise && local_ips.contains(&device.address.ip()))
+                                        || device.certificate == certificate
+                                    {
+                                        continue;
+                                    }
                                     let mut state = state.lock().unwrap();
                                     if state.devices.contains_key(service.get_fullname())
                                         || state.devices.len() < MAX_DEVICES
@@ -248,8 +259,12 @@ impl Discovery {
                     }
                     match listener.accept() {
                         Ok((socket, peer)) if is_local(peer.ip()) && workers.len() < 4 => {
-                            let (config, state, controller) =
-                                (config.clone(), state.clone(), controller.clone());
+                            let (config, state, controller, previews) = (
+                                config.clone(),
+                                state.clone(),
+                                controller.clone(),
+                                previews.clone(),
+                            );
                             let cancel = Arc::new(Lifetime::default());
                             if cancel.track(&socket).is_err() {
                                 continue;
@@ -262,6 +277,7 @@ impl Discovery {
                                         peer.ip(),
                                         config,
                                         &worker_cancel,
+                                        &previews,
                                         |peer, life| controller.request(peer, life),
                                     );
                                     if let Err(e) = result {
@@ -331,6 +347,14 @@ fn identity() -> Result<(Arc<ServerConfig>, Vec<u8>)> {
 struct Request {
     version: u16,
     name: String,
+    #[serde(default)]
+    operation: Option<Operation>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+enum Operation {
+    Connect,
+    Preview,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -338,6 +362,7 @@ enum Reply {
     Starting,
     Ready(SessionTicket),
     Error(RemoteError),
+    Preview,
 }
 
 type LaunchResult = std::result::Result<SessionTicket, RemoteError>;
@@ -347,6 +372,7 @@ fn incoming(
     peer: IpAddr,
     config: Arc<ServerConfig>,
     life: &Arc<Lifetime>,
+    previews: &PreviewCache,
     launch: impl FnOnce(
         IpAddr,
         Arc<Lifetime>,
@@ -375,6 +401,32 @@ fn incoming(
             &Reply::Error(RemoteError::new("incompatible_request", e.to_string())),
         )?;
         return Ok(());
+    }
+    match request.operation {
+        Some(Operation::Preview) => {
+            match previews.get() {
+                Ok(bytes) => {
+                    protocol::write_json(&mut stream, &Reply::Preview)?;
+                    protocol::write_packet(&mut stream, &bytes, protocol::MAX_PREVIEW)?;
+                }
+                Err(error) => protocol::write_json(
+                    &mut stream,
+                    &Reply::Error(RemoteError::new("preview_unavailable", error)),
+                )?,
+            }
+            return Ok(());
+        }
+        Some(Operation::Connect) => {}
+        None => {
+            protocol::write_json(
+                &mut stream,
+                &Reply::Error(RemoteError::new(
+                    "missing_operation",
+                    "Update Localnet on both computers",
+                )),
+            )?;
+            return Ok(());
+        }
     }
     let receiver = match launch(peer, life.clone()) {
         Ok(receiver) => receiver,
@@ -467,7 +519,7 @@ fn outgoing(
 ) -> Result<SessionTicket> {
     ensure!(
         device.compatible(),
-        "Update Localnet on this computer and {} to 0.2.0 or newer; the old pairing build cannot connect without codes.",
+        "Update Localnet on both computers to 0.3.0 (gallery preview protocol). Incompatible computer: {}.",
         device.name
     );
     let provisional = SessionTicket {
@@ -484,6 +536,7 @@ fn outgoing(
         &Request {
             version: protocol::VERSION,
             name: computer_name(),
+            operation: Some(Operation::Connect),
         },
     )?;
     let expires = Instant::now() + STARTUP_TIMEOUT;
@@ -505,13 +558,116 @@ fn outgoing(
                 ensure!(ticket.address.ip() == device.address.ip(), "Remote host address changed during startup");
                 return Ok(ticket);
             }
+            Reply::Preview => anyhow::bail!("Unexpected preview response to a connection request"),
         }
+    }
+}
+
+pub fn fetch_preview(device: &Device, life: &Lifetime) -> Result<Vec<u8>> {
+    ensure!(
+        device.compatible(),
+        "Update Localnet on both computers to 0.3.0"
+    );
+    let provisional = SessionTicket {
+        version: protocol::VERSION,
+        address: device.address,
+        certificate: device.certificate.clone(),
+        token: String::new(),
+    };
+    let mut stream =
+        transport::connect(&provisional, transport::client_config(&provisional)?, life)?;
+    stream.sock.renew();
+    protocol::write_json(
+        &mut stream,
+        &Request {
+            version: protocol::VERSION,
+            name: computer_name(),
+            operation: Some(Operation::Preview),
+        },
+    )?;
+    match protocol::read_json::<Reply>(&mut stream)? {
+        Reply::Preview => protocol::read_packet(&mut stream, protocol::MAX_PREVIEW),
+        Reply::Error(error) => anyhow::bail!("{error}"),
+        _ => anyhow::bail!("Unexpected response to screenshot preview request"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_thumbnail() -> Result<Vec<u8>> {
+        let rgb = image::RgbImage::from_pixel(8, 4, image::Rgb([25, 45, 80]));
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes).encode_image(&rgb)?;
+        Ok(bytes)
+    }
+
+    #[test]
+    fn preview_request_never_launches_host_or_input() {
+        let (config, certificate) = identity().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let device = Device {
+            name: "Preview-only PC".into(),
+            address: listener.local_addr().unwrap(),
+            certificate,
+            version: protocol::VERSION,
+        };
+        let server = thread::spawn(move || {
+            let cache = PreviewCache::new(fake_thumbnail);
+            for _ in 0..2 {
+                incoming(listener.accept().unwrap().0, "127.0.0.1".parse().unwrap(), config.clone(), &Arc::new(Lifetime::default()), &cache,
+                    |_,_| panic!("A screenshot must not launch screen control or require input permission")).unwrap();
+            }
+        });
+        for _ in 0..2 {
+            let life = Lifetime::default();
+            let bytes = fetch_preview(&device, &life).unwrap();
+            life.stop();
+            assert_eq!(
+                crate::viewer::FrameDecoder::new()
+                    .unwrap()
+                    .decode_bounded(&bytes, 480, 270)
+                    .unwrap()
+                    .size,
+                [8, 4]
+            );
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "Captures one local thumbnail over loopback without creating a viewer or input device"]
+    fn real_screenshot_preview_without_control_session() {
+        let (config, certificate) = identity().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let device = Device {
+            name: "Screenshot PC".into(),
+            address: listener.local_addr().unwrap(),
+            certificate,
+            version: protocol::VERSION,
+        };
+        let server = thread::spawn(move || {
+            incoming(
+                listener.accept().unwrap().0,
+                "127.0.0.1".parse().unwrap(),
+                config,
+                &Arc::new(Lifetime::default()),
+                &PreviewCache::default(),
+                |_, _| panic!("Preview must never start a full session"),
+            )
+            .unwrap();
+        });
+        let life = Lifetime::default();
+        let bytes = fetch_preview(&device, &life).unwrap();
+        life.stop();
+        let image = crate::viewer::FrameDecoder::new()
+            .unwrap()
+            .decode_bounded(&bytes, 480, 270)
+            .unwrap();
+        assert!(image.size[0] <= 480 && image.size[1] <= 270);
+        server.join().unwrap();
+    }
 
     #[test]
     fn discovery_handles_old_versions_and_rejects_malformed_records() {
@@ -582,6 +738,7 @@ mod tests {
                     "127.0.0.1".parse().unwrap(),
                     config,
                     &life,
+                    &PreviewCache::default(),
                     |_, _| Ok(receiver),
                 )
                 .unwrap();
@@ -651,6 +808,7 @@ mod tests {
                 "127.0.0.1".parse().unwrap(),
                 config,
                 &Arc::new(Lifetime::default()),
+                &PreviewCache::default(),
                 |_, _| {
                     panic!("An incompatible version must not start capture");
                 },
@@ -668,6 +826,7 @@ mod tests {
             &Request {
                 version: 1,
                 name: "Old PC".into(),
+                operation: Some(Operation::Preview),
             },
         )
         .unwrap();
@@ -708,6 +867,7 @@ mod tests {
                     "127.0.0.1".parse().unwrap(),
                     config.clone(),
                     &life,
+                    &PreviewCache::default(),
                     |peer, life| host.request(peer, life),
                 )
                 .unwrap();

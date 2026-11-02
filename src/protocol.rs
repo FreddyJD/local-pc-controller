@@ -5,7 +5,10 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
+pub const MAX_PREVIEW: usize = 256 * 1024;
+pub const PREVIEW_WIDTH: u32 = 480;
+pub const PREVIEW_HEIGHT: u32 = 270;
 pub const MAX_JSON: usize = 16 * 1024;
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const MAX_EVENTS: usize = 64;

@@ -275,13 +275,25 @@ impl FrameDecoder {
     }
 
     pub fn decode(&mut self, bytes: &[u8]) -> Result<egui::ColorImage> {
+        self.decode_bounded(bytes, 3840, 2160)
+    }
+
+    pub fn decode_bounded(
+        &mut self,
+        bytes: &[u8],
+        max_width: usize,
+        max_height: usize,
+    ) -> Result<egui::ColorImage> {
         ensure!(
             !bytes.is_empty() && bytes.len() <= MAX_FRAME,
             "Invalid frame size"
         );
         let header = self.decoder.read_header(bytes)?;
         ensure!(
-            header.width > 0 && header.height > 0 && header.width <= 3840 && header.height <= 2160,
+            header.width > 0
+                && header.height > 0
+                && header.width <= max_width
+                && header.height <= max_height,
             "Frame dimensions exceed limit"
         );
         ensure!(

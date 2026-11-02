@@ -2,11 +2,13 @@ use crate::{
     discovery::{Device, Discovery, Outgoing},
     host::VideoSettings,
     input::named_key,
+    preview::Previews,
     protocol::{Button, Input, Modifiers, SessionTicket, is_local},
     viewer::Viewer,
 };
 use eframe::egui::{self, Color32, Event, Rect, TextureHandle, TextureOptions};
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
@@ -20,7 +22,13 @@ struct RemoteSession {
     texture: Option<TextureHandle>,
 }
 
+struct TileTexture {
+    texture: TextureHandle,
+    certificate: Vec<u8>,
+}
+
 pub struct Localnet {
+    pub chrome: crate::chrome::Chrome,
     interfaces: Vec<(String, IpAddr)>,
     interface: usize,
     settings: VideoSettings,
@@ -36,16 +44,61 @@ pub struct Localnet {
     last_modifiers: Modifiers,
     discovery: Option<Discovery>,
     outgoing: Option<Outgoing>,
+    gallery: bool,
+    settings_open: bool,
+    previews: Option<Previews>,
+    thumbnails: HashMap<SocketAddr, TileTexture>,
 }
 
 impl Localnet {
     pub fn new(ctx: &egui::Context) -> Self {
+        ctx.set_theme(egui::Theme::Dark);
         ctx.set_visuals(egui::Visuals::dark());
         ctx.global_style_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(10.0, 10.0);
-            s.spacing.button_padding = egui::vec2(14.0, 8.0);
-            s.visuals.selection.bg_fill = Color32::from_rgb(33, 115, 100);
+            s.text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+            s.text_styles
+                .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+            s.text_styles
+                .insert(egui::TextStyle::Heading, egui::FontId::proportional(24.0));
+            s.spacing.item_spacing = egui::vec2(12.0, 12.0);
+            s.spacing.button_padding = egui::vec2(12.0, 7.0);
+            s.visuals.panel_fill = Color32::from_rgb(20, 21, 24);
+            s.visuals.window_fill = Color32::from_rgb(26, 27, 31);
+            s.visuals.override_text_color = Some(Color32::from_rgb(224, 225, 230));
+            s.visuals.selection.bg_fill = Color32::from_rgb(76, 80, 145);
+            s.visuals.widgets.inactive.bg_fill = Color32::from_rgb(34, 35, 40);
+            s.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(30, 31, 36);
+            s.visuals.widgets.inactive.bg_stroke =
+                egui::Stroke::new(1.0, Color32::from_rgb(52, 53, 61));
+            s.visuals.widgets.hovered.bg_fill = Color32::from_rgb(47, 48, 57);
+            s.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(42, 43, 51);
         });
+        // Load installed platform UI fonts, without bundling or downloading licensed system fonts.
+        let fonts = if cfg!(target_os = "windows") {
+            vec!["C:/Windows/Fonts/segoeui.ttf"]
+        } else {
+            vec![
+                "/System/Library/Fonts/SFNS.ttf",
+                "/System/Library/Fonts/Helvetica.ttc",
+            ]
+        };
+        for path in fonts {
+            if let Ok(bytes) = std::fs::read(path) {
+                let mut fonts = egui::FontDefinitions::default();
+                fonts.font_data.insert(
+                    "system-ui".into(),
+                    std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                );
+                fonts
+                    .families
+                    .get_mut(&egui::FontFamily::Proportional)
+                    .unwrap()
+                    .insert(0, "system-ui".into());
+                ctx.set_fonts(fonts);
+                break;
+            }
+        }
         let mut interfaces: Vec<_> = if_addrs::get_if_addrs()
             .unwrap_or_default()
             .into_iter()
@@ -57,6 +110,7 @@ impl Localnet {
             "127.0.0.1".parse().unwrap(),
         ));
         Self {
+            chrome: Default::default(),
             interfaces,
             interface: 0,
             settings: VideoSettings {
@@ -76,6 +130,10 @@ impl Localnet {
             last_modifiers: Modifiers::default(),
             discovery: None,
             outgoing: None,
+            gallery: true,
+            settings_open: false,
+            previews: Some(Previews::new()),
+            thumbnails: HashMap::new(),
         }
     }
 
@@ -115,7 +173,7 @@ impl Localnet {
     }
 
     fn select_session(&mut self, index: usize) {
-        if index >= self.sessions.len() || self.active == Some(index) {
+        if index >= self.sessions.len() || (self.active == Some(index) && !self.gallery) {
             return;
         }
         self.release();
@@ -123,6 +181,7 @@ impl Localnet {
         self.events.clear();
         self.remote_rect = None;
         self.active = Some(index);
+        self.gallery = false;
     }
 
     fn disconnect_active(&mut self) {
@@ -134,6 +193,14 @@ impl Localnet {
             self.active = (!self.sessions.is_empty())
                 .then_some(index.min(self.sessions.len().saturating_sub(1)));
         }
+        self.gallery = true;
+    }
+
+    fn show_gallery(&mut self) {
+        self.release();
+        self.events.clear();
+        self.remote_rect = None;
+        self.gallery = true;
     }
 
     fn shutdown(&mut self) {
@@ -144,6 +211,9 @@ impl Localnet {
         self.sessions.clear();
         self.outgoing.take();
         self.discovery.take();
+        self.previews.take();
+        self.thumbnails.clear();
+        self.gallery = true;
     }
 
     fn incoming_viewer(&self) -> bool {
@@ -155,7 +225,7 @@ impl Localnet {
     fn connect_device(&mut self, device: Device) {
         if !device.compatible() {
             self.error = format!(
-                "Update Localnet on {} and this computer to 0.2.0 or newer. The Mac/PC is still running the older pairing version.",
+                "Update Localnet on {} and this computer to 0.3.0 to use screenshot previews and connect.",
                 device.name
             );
             return;
@@ -208,6 +278,7 @@ impl Localnet {
             texture: None,
         });
         self.active = Some(self.sessions.len() - 1);
+        self.gallery = false;
         Ok(())
     }
 
@@ -224,7 +295,9 @@ impl Localnet {
 
     fn route_input(&mut self) {
         let events = std::mem::take(&mut self.events);
-        if !self.focused
+        if self.gallery
+            || self.settings_open
+            || !self.focused
             || self.incoming_viewer()
             || !self
                 .active
@@ -361,6 +434,431 @@ impl Localnet {
             self.sync_modifiers(self.modifiers);
         }
     }
+
+    fn header(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let (left, right) = self.chrome.insets(&ctx);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), egui::Sense::hover());
+        ui.painter().rect_filled(
+            Rect::from_min_max(rect.min, rect.max - egui::vec2(right, 0.0)),
+            0.0,
+            Color32::from_rgb(20, 21, 24),
+        );
+        let content = Rect::from_min_max(
+            rect.min + egui::vec2(left, 0.0),
+            rect.max - egui::vec2(right, 0.0),
+        );
+        let mut controls = Vec::new();
+        let buttons_width = if self.gallery { 210.0 } else { 248.0 };
+        let split = (content.right() - buttons_width).max(content.left() + 36.0);
+        let navigation = Rect::from_min_max(content.min, egui::pos2(split - 8.0, content.bottom()));
+        let actions = Rect::from_min_max(egui::pos2(split, content.top()), content.max);
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(navigation)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                if !self.gallery {
+                    let back = ui.button("<").on_hover_text("Computers");
+                    controls.push(back.rect);
+                    back.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Computers")
+                    });
+                    if back.clicked() {
+                        self.show_gallery();
+                    }
+                    if let Some(index) = self.active {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&self.sessions[index].name).strong(),
+                            )
+                            .truncate(),
+                        );
+                    }
+                } else {
+                    ui.label(egui::RichText::new("Localnet").size(15.0).strong());
+                }
+            },
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(actions)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| {
+                let settings = ui.button("...").on_hover_text("Settings");
+                controls.push(settings.rect);
+                settings.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Settings")
+                });
+                if settings.clicked() {
+                    self.release();
+                    self.events.clear();
+                    self.settings_open = !self.settings_open;
+                }
+                if !self.gallery && self.active.is_some() {
+                    let disconnect = ui.button("Disconnect");
+                    controls.push(disconnect.rect);
+                    if disconnect.clicked() {
+                        self.disconnect_active();
+                    }
+                    let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                    let fullscreen = ui
+                        .button(if full { "Shrink" } else { "Expand" })
+                        .on_hover_text("Toggle full screen");
+                    controls.push(fullscreen.rect);
+                    if fullscreen.clicked() {
+                        self.release();
+                        self.events.clear();
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
+                    }
+                } else {
+                    let color = if self.discovery.is_some() {
+                        Color32::from_rgb(115, 174, 143)
+                    } else {
+                        Color32::from_gray(110)
+                    };
+                    ui.label(
+                        egui::RichText::new(if self.discovery.is_some() {
+                            "On your network"
+                        } else {
+                            "Local access off"
+                        })
+                        .small()
+                        .color(color),
+                    );
+                }
+            },
+        );
+        // Register dragging only in the gaps; a full-header response steals clicks from its buttons.
+        let mut gaps = vec![content];
+        for control in &controls {
+            let mut next = Vec::new();
+            for gap in gaps {
+                if gap.intersects(*control) {
+                    if control.left() > gap.left() {
+                        next.push(Rect::from_min_max(
+                            gap.min,
+                            egui::pos2(control.left(), gap.bottom()),
+                        ));
+                    }
+                    if control.right() < gap.right() {
+                        next.push(Rect::from_min_max(
+                            egui::pos2(control.right(), gap.top()),
+                            gap.max,
+                        ));
+                    }
+                } else {
+                    next.push(gap);
+                }
+            }
+            gaps = next;
+        }
+        for (index, gap) in gaps.into_iter().enumerate() {
+            let drag = ui.interact(
+                gap,
+                ui.id().with(("window-drag", index)),
+                egui::Sense::click_and_drag(),
+            );
+            if drag.double_clicked() {
+                let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            } else if drag.drag_started() {
+                self.release();
+                self.events.clear();
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+        }
+        if self.settings_open {
+            controls.push(rect);
+        }
+        self.chrome.update(&ctx, rect, controls);
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom(),
+            egui::Stroke::new(1.0, Color32::from_rgb(39, 40, 46)),
+        );
+    }
+
+    fn settings_panel(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_open;
+        egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).default_width(420.0).show(ctx, |ui| {
+            ui.label(egui::RichText::new(crate::discovery::computer_name()).strong());
+            ui.label("Trusted LAN mode. Computers on this private network can see previews and control this computer while local access is enabled.");
+            if let Some(discovery) = &self.discovery {
+                let host = discovery.controller.state.lock().unwrap();
+                ui.small(if host.sharing { "Screen sharing is active" } else { "Ready for incoming connections" });
+                ui.label(&host.status);
+                drop(host);
+                if ui.button("Disable local access").clicked() { self.discovery.take(); }
+            } else if ui.button("Enable local access").clicked() { self.previews.get_or_insert_with(Previews::new); self.enable_discovery(); }
+            ui.separator();
+            egui::ComboBox::from_label("Network").selected_text(self.interfaces[self.interface].1.to_string()).show_ui(ui, |ui| {
+                for (index, (name, ip)) in self.interfaces.iter().enumerate() {
+                    ui.selectable_value(&mut self.interface, index, format!("{name} / {ip}"));
+                }
+            });
+            if ui.button("Apply network").clicked() { self.discovery.take(); self.thumbnails.clear(); self.enable_discovery(); }
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Video").strong());
+            ui.add(egui::Slider::new(&mut self.settings.fps, 5..=60).text("Target FPS"));
+            ui.add(egui::Slider::new(&mut self.settings.width, 640..=3840).text("Maximum width"));
+            ui.add(egui::Slider::new(&mut self.settings.quality, 20..=95).text("Quality"));
+            ui.small("Applied on the next incoming connection. JPEG video; target FPS is not guaranteed.");
+            if let Some(discovery) = &self.discovery { *discovery.controller.settings.lock().unwrap() = self.settings; }
+            if cfg!(target_os = "macos") {
+                ui.separator(); ui.label("Sharing needs Screen Recording and Accessibility. Previews only need Screen Recording.");
+                if ui.button("Check Mac permissions").clicked() {
+                    self.error = match crate::capture::request_permissions() { Ok(()) => "OS permissions are available.".into(), Err(e) => format!("{e:#}") };
+                }
+            }
+            ui.separator();
+            ui.small("Ctrl+Shift+F12 releases remote input. Copy/paste uses the remote clipboard.");
+            ui.small(format!("Localnet {} / LAN only / TLS encrypted", env!("CARGO_PKG_VERSION")));
+            if ui.button("Disconnect everything and stop local access").clicked() { self.shutdown(); }
+        });
+        self.settings_open = open;
+    }
+
+    fn gallery_view(&mut self, ui: &mut egui::Ui, devices: &[Device]) {
+        let ctx = ui.ctx().clone();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Frame::new().inner_margin(28.0).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 12.0;
+                ui.heading("Computers");
+                ui.label(
+                    egui::RichText::new("Your other screens, one click away.")
+                        .color(Color32::from_gray(143)),
+                );
+                ui.add_space(18.0);
+                if devices.is_empty() && self.sessions.is_empty() {
+                    ui.add_space(70.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new(if self.discovery.is_some() {
+                                "Looking for your computers"
+                            } else {
+                                "Local access is off"
+                            })
+                            .size(17.0),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Open Localnet on another Mac or Windows PC on this network.",
+                            )
+                            .color(Color32::from_gray(145)),
+                        );
+                        if self.discovery.is_none() && ui.button("Enable local access").clicked() {
+                            self.previews.get_or_insert_with(Previews::new);
+                            self.enable_discovery();
+                        }
+                    });
+                    return;
+                }
+                let columns = ((ui.available_width() + 22.0) / 300.0)
+                    .floor()
+                    .clamp(1.0, 4.0) as usize;
+                let width = ((ui.available_width() - 22.0 * (columns - 1) as f32) / columns as f32)
+                    .min(440.0);
+                let mut clicked = None;
+                for row in devices.chunks(columns) {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 22.0;
+                        for device in row {
+                            let (area, response) = ui.allocate_exact_size(
+                                egui::vec2(width, width * 9.0 / 16.0 + 57.0),
+                                egui::Sense::click(),
+                            );
+                            let preview = Rect::from_min_size(
+                                area.min,
+                                egui::vec2(width, width * 9.0 / 16.0),
+                            );
+                            let hovered = response.hovered() || response.has_focus();
+                            let border = if hovered {
+                                Color32::from_rgb(113, 117, 174)
+                            } else {
+                                Color32::from_rgb(52, 53, 61)
+                            };
+                            ui.painter()
+                                .rect_filled(preview, 8.0, Color32::from_rgb(29, 30, 35));
+                            let session = self
+                                .sessions
+                                .iter()
+                                .find(|s| s.address.ip() == device.address.ip());
+                            let texture = session.and_then(|s| s.texture.as_ref()).or_else(|| {
+                                self.thumbnails.get(&device.address).map(|t| &t.texture)
+                            });
+                            if let Some(texture) = texture {
+                                let pixels = texture.size_vec2();
+                                let scale =
+                                    (preview.width() / pixels.x).min(preview.height() / pixels.y);
+                                let image_rect =
+                                    Rect::from_center_size(preview.center(), pixels * scale)
+                                        .shrink(1.0);
+                                ui.painter().image(
+                                    texture.id(),
+                                    image_rect,
+                                    Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                            } else {
+                                let label = if !device.compatible() {
+                                    "Update Localnet to 0.3.0"
+                                } else if self
+                                    .previews
+                                    .as_ref()
+                                    .and_then(|p| p.thumbnails.get(&device.address))
+                                    .is_some_and(|t| t.error.is_some())
+                                {
+                                    "Preview unavailable"
+                                } else {
+                                    "Getting a preview..."
+                                };
+                                ui.painter().text(
+                                    preview.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    label,
+                                    egui::FontId::proportional(13.0),
+                                    Color32::from_gray(145),
+                                );
+                            }
+                            ui.painter().rect_stroke(
+                                preview,
+                                8.0,
+                                egui::Stroke::new(1.0, border),
+                                egui::StrokeKind::Inside,
+                            );
+                            ui.painter().text(
+                                egui::pos2(area.left(), preview.bottom() + 16.0),
+                                egui::Align2::LEFT_CENTER,
+                                &device.name,
+                                egui::FontId::proportional(14.0),
+                                Color32::from_gray(225),
+                            );
+                            let connected = session.is_some_and(|s| s.viewer.connected());
+                            let status = if !device.compatible() {
+                                "Update required"
+                            } else if connected {
+                                "Connected"
+                            } else {
+                                "On your network"
+                            };
+                            ui.painter().text(
+                                egui::pos2(area.left(), preview.bottom() + 36.0),
+                                egui::Align2::LEFT_CENTER,
+                                status,
+                                egui::FontId::proportional(12.0),
+                                Color32::from_gray(132),
+                            );
+                            response.clone().widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    format!("Open {}", device.name),
+                                )
+                            });
+                            if let Some(thumb) = self
+                                .previews
+                                .as_ref()
+                                .and_then(|p| p.thumbnails.get(&device.address))
+                            {
+                                if let Some(error) = &thumb.error {
+                                    response
+                                        .clone()
+                                        .on_hover_text(format!("Preview unavailable: {error}"));
+                                } else if let Some(updated) = thumb.updated {
+                                    response.clone().on_hover_text(format!(
+                                        "Screenshot updated {}s ago. Click to control.",
+                                        updated.elapsed().as_secs()
+                                    ));
+                                }
+                            }
+                            if response.clicked()
+                                || (response.has_focus()
+                                    && ctx.input(|i| i.key_pressed(egui::Key::Enter)))
+                            {
+                                clicked = Some(device.clone());
+                            }
+                        }
+                    });
+                    ui.add_space(14.0);
+                }
+                if let Some(device) = clicked {
+                    self.connect_device(device);
+                }
+                let mut selected = None;
+                for (index, session) in self
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| !devices.iter().any(|d| d.address.ip() == s.address.ip()))
+                {
+                    if ui
+                        .button(format!(
+                            "Open {} / {}",
+                            session.name,
+                            if session.viewer.connected() {
+                                "Connected"
+                            } else {
+                                "Disconnected"
+                            }
+                        ))
+                        .clicked()
+                    {
+                        selected = Some(index);
+                    }
+                }
+                if let Some(index) = selected {
+                    self.select_session(index);
+                }
+            });
+        });
+    }
+
+    fn remote_view(&mut self, ui: &mut egui::Ui) {
+        let Some(index) = self.active else {
+            self.gallery = true;
+            return;
+        };
+        let session = &self.sessions[index];
+        let area = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(area, 0.0, Color32::BLACK);
+        if let Some(texture) = &session.texture {
+            let pixels = texture.size_vec2();
+            let scale = (area.width() / pixels.x).min(area.height() / pixels.y);
+            let rect = Rect::from_center_size(area.center(), pixels * scale);
+            ui.painter().image(
+                texture.id(),
+                rect,
+                Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            if session.viewer.connected() && !self.settings_open {
+                self.remote_rect = Some(rect);
+            }
+        } else {
+            ui.painter().text(
+                area.center(),
+                egui::Align2::CENTER_CENTER,
+                session.viewer.state.lock().unwrap().status.clone(),
+                egui::FontId::proportional(14.0),
+                Color32::from_gray(180),
+            );
+        }
+        if !session.viewer.connected() {
+            let message = session.viewer.state.lock().unwrap().status.clone();
+            ui.scope_builder(egui::UiBuilder::new().max_rect(area.shrink(24.0)), |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(35, 28, 30))
+                    .inner_margin(12.0)
+                    .corner_radius(6)
+                    .show(ui, |ui| {
+                        ui.label(message);
+                    });
+            });
+        }
+        ui.allocate_rect(area, egui::Sense::hover());
+    }
 }
 
 fn remote_modifiers(value: egui::Modifiers) -> Modifiers {
@@ -373,6 +871,9 @@ fn remote_modifiers(value: egui::Modifiers) -> Modifiers {
 }
 
 impl eframe::App for Localnet {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         if (!raw.focused || self.incoming_viewer()) && self.controlling {
             self.release();
@@ -424,147 +925,118 @@ impl eframe::App for Localnet {
                 Err(e) => self.error = e,
             }
         }
-        ui.horizontal(|ui| {
-            ui.heading("LOCALNET");
-            ui.label(
-                egui::RichText::new("PRIVATE LAN / REMOTE DESKTOP")
-                    .small()
-                    .color(Color32::from_rgb(107, 175, 156)),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Stop all").clicked() {
-                    self.shutdown();
-                }
-                if self.controlling && ui.button("Release input").clicked() {
-                    self.release();
-                }
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let mut devices = self
+            .discovery
+            .as_ref()
+            .map(|discovery| {
+                discovery
+                    .state
+                    .lock()
+                    .unwrap()
+                    .devices
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        devices.sort_by(|a, b| a.name.cmp(&b.name).then(a.address.cmp(&b.address)));
+        let previews_enabled = self.gallery
+            && self.outgoing.is_none()
+            && ctx.input(|i| {
+                i.viewport().visible() != Some(false) && i.viewport().minimized != Some(true)
             });
-        });
-        ui.separator();
-        egui::Panel::left("computers").default_size(300.0).size_range(260.0..=380.0)
-            .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("This computer");
-                    ui.label(if cfg!(target_os = "macos") { "macOS / Local sharing" } else { "Windows / Local sharing" });
-                    ui.heading("Nearby computers");
-                    ui.label("Trusted LAN mode: no pairing codes or approval. Computers running Localnet can connect automatically.");
-                    if let Some(discovery) = &self.discovery {
-                        let (status, mut devices) = { let state = discovery.state.lock().unwrap();
-                            (state.status.clone(), state.devices.values().cloned().collect::<Vec<_>>()) };
-                        ui.label(status);
-                        devices.sort_by(|a,b| a.name.cmp(&b.name).then(a.address.cmp(&b.address)));
-                        if devices.is_empty() { ui.label("Open Localnet on your other computers. They will appear here automatically."); }
-                        for device in devices {
-                            ui.label(format!("{} ({})", device.name, device.address.ip()));
-                            if !device.compatible() { ui.colored_label(Color32::LIGHT_RED, "Update required on this computer and the other computer (0.2.0+)"); }
-                            if ui.add_enabled(self.outgoing.is_none(),
-                                egui::Button::new(format!("Connect to {}", device.name))).clicked() {
-                                self.connect_device(device);
-                            }
-                        }
-                        if ui.button("Disable local access / disconnect incoming viewer").clicked() { self.discovery.take(); }
-                        ctx.request_repaint_after(Duration::from_millis(100));
-                    } else if ui.button("Enable local access and discovery").clicked() { self.enable_discovery(); }
-                    if let Some(outgoing) = &mut self.outgoing {
-                        let state = outgoing.state.lock().unwrap();
-                        ui.label(format!("Connecting to {}", outgoing.device.name));
-                        ui.label(&state.status);
-                        drop(state);
-                        if ui.button("Cancel connection request").clicked() { self.outgoing.take(); }
-                    }
-                    ui.separator();
-                    if let Some(discovery) = &self.discovery {
-                        let host = discovery.controller.state.lock().unwrap();
-                        ui.colored_label(Color32::from_rgb(107, 175, 156), if host.sharing { "Sharing automatically" } else { "Ready for incoming connections" });
-                        ui.label(&host.status);
-                        if host.has_viewer { ui.label("Outgoing input is paused while this computer is controlled, to prevent control loops."); }
-                    }
-                    ui.label("Any reachable device on the selected private network can view and control this computer while local access is enabled. Use only on your trusted personal network.");
-                    ui.collapsing("Network and video settings", |ui| {
-                        egui::ComboBox::from_label("LAN interface")
-                            .selected_text(format!("{} ({})", self.interfaces[self.interface].0, self.interfaces[self.interface].1))
-                            .show_ui(ui, |ui| {
-                                for (index, (name, ip)) in self.interfaces.iter().enumerate() {
-                                    ui.selectable_value(&mut self.interface, index, format!("{name} ({ip})"));
-                                }
-                            });
-                            ui.add(egui::Slider::new(&mut self.settings.fps, 5..=60).text("Target FPS (cap, not guaranteed)"));
-                            ui.add(egui::Slider::new(&mut self.settings.width, 640..=3840).text("Video width"));
-                            ui.add(egui::Slider::new(&mut self.settings.quality, 20..=95).text("JPEG quality"));
-                        if cfg!(target_os = "macos") {
-                            ui.label("Mac: enable Screen Recording, Accessibility, and Local Network in System Settings. OS permissions cannot be removed by Localnet.");
-                            if ui.button("Check / request OS permissions").clicked() {
-                                self.error = match crate::capture::request_permissions() { Ok(()) => "OS permissions are available.".into(), Err(e) => format!("{e:#}") };
-                            }
-                        } else {
-                            ui.label("Allow Localnet through Windows Firewall on Private networks when sharing.");
-                        }
-                        if let Some(discovery) = &self.discovery { *discovery.controller.settings.lock().unwrap() = self.settings; }
-                        if ui.button("Apply interface / restart local access").clicked() { self.discovery.take(); self.enable_discovery(); }
-                    });
-                    ui.add_space(16.0);
-                    ui.separator();
-                    ui.label(format!("{} / {MAX_SESSIONS} remote sessions. Sharing and viewing work independently.", self.sessions.len()));
-                    if !self.error.is_empty() { ui.colored_label(Color32::from_rgb(245, 140, 130), &self.error); }
-                    ui.add_space(16.0);
-                    ui.label("LAN only / TLS encrypted / No cloud");
-                    ui.label("Windows: native DXGI capture with screenshot fallback. Native TurboJPEG encoding; not hardware H.264 or zero latency.");
-                });
+        if let Some(previews) = &mut self.previews {
+            previews.tick(&devices, previews_enabled);
+            self.thumbnails.retain(|address, tile| {
+                devices
+                    .iter()
+                    .any(|d| d.address == *address && d.certificate == tile.certificate)
             });
-        self.remote_rect = None;
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            if self.sessions.is_empty() {
-                ui.heading("One app. Either direction.");
-                ui.label("Control Windows from your Mac, or your Mac from Windows.");
-                ui.add_space(16.0);
-                ui.label("Open Localnet on both computers. Click a nearby computer to see and control it. No codes or approval dialogs.");
-                ui.label("Disconnect when finished; sharing ends automatically and you can reconnect from the same list.");
-                return;
+            for (address, thumb) in &mut previews.thumbnails {
+                if let Some(image) = thumb.image.take() {
+                    if let Some(tile) = self.thumbnails.get_mut(address) {
+                        tile.texture.set(image, TextureOptions::LINEAR);
+                    } else {
+                        self.thumbnails.insert(
+                            *address,
+                            TileTexture {
+                                texture: ctx.load_texture(
+                                    format!("preview-{address}"),
+                                    image,
+                                    TextureOptions::LINEAR,
+                                ),
+                                certificate: thumb.device.certificate.clone(),
+                            },
+                        );
+                    }
+                }
             }
-            let mut selected = None;
-            ui.horizontal_wrapped(|ui| {
-                for (index, session) in self.sessions.iter().enumerate() {
-                    let suffix = if session.viewer.connected() { "" } else { " (disconnected)" };
-                    if ui.selectable_label(self.active == Some(index), format!("{}{suffix}", session.name)).clicked() {
-                        selected = Some(index);
-                    }
-                }
-            });
-            if let Some(index) = selected { self.select_session(index); }
-            ui.horizontal(|ui| {
-                if ui.button("Disconnect selected computer").clicked() { self.disconnect_active(); }
-            });
-            let Some(index) = self.active else { return; };
-            let session = &mut self.sessions[index];
-            let (status, frame, rtt, video_time, frames, remote_mac) = {
-                let mut state = session.viewer.state.lock().unwrap();
-                (state.status.clone(), state.frame.take(), state.input_rtt_ms, state.frame_roundtrip_ms,
-                    state.frames, state.display.as_ref().map(|d| d.mac))
-            };
-            ui.heading(&session.name);
-            ui.label(format!("{} / {}", remote_mac.map_or("Connecting", |mac| if mac { "macOS" } else { "Windows" }), session.address));
-            ui.label(status);
-            ui.label(format!("Input ACK: {rtt:.1} ms | Receive + decode: {video_time:.1} ms | Frames: {frames}"));
-            ui.label(if self.controlling { "Controlling this computer. Ctrl+Shift+F12 releases input." }
-                else { "Click the screen to control. Ctrl/Command follows the remote OS; clipboard shortcuts use its clipboard." });
-            if let Some(image) = frame {
-                if image.size.iter().any(|side| *side > ctx.input(|i| i.max_texture_side)) {
+        }
+        for session in &mut self.sessions {
+            let image = session.viewer.state.lock().unwrap().frame.take();
+            if let Some(image) = image {
+                if image
+                    .size
+                    .iter()
+                    .any(|side| *side > ctx.input(|i| i.max_texture_side))
+                {
                     self.error = "Frame exceeds GPU texture limit. Reduce host video width.".into();
                     session.viewer.stop();
-                } else if let Some(texture) = &mut session.texture { texture.set(image, TextureOptions::LINEAR); }
-                else { session.texture = Some(ctx.load_texture(format!("remote-{}", session.address), image, TextureOptions::LINEAR)); }
+                } else if let Some(texture) = &mut session.texture {
+                    texture.set(image, TextureOptions::LINEAR);
+                } else {
+                    session.texture = Some(ctx.load_texture(
+                        format!("remote-{}", session.address),
+                        image,
+                        TextureOptions::LINEAR,
+                    ));
+                }
             }
-            if let Some(texture) = &session.texture {
-                let available = ui.available_size().max(egui::vec2(1.0, 1.0));
-                let pixels = texture.size_vec2();
-                let scale = (available.x / pixels.x).min(available.y / pixels.y);
-                let (_, area) = ui.allocate_space(available);
-                let rect = Rect::from_center_size(area.center(), pixels * scale);
-                ui.painter().rect_filled(area, 0.0, Color32::BLACK);
-                ui.painter().image(texture.id(), rect, Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
-                if session.viewer.connected() { self.remote_rect = Some(rect); }
-            }
-        });
+        }
+        self.header(ui);
+        self.remote_rect = None;
+        if !self.error.is_empty() {
+            egui::Frame::new()
+                .fill(Color32::from_rgb(50, 29, 34))
+                .inner_margin(12.0)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(Color32::from_rgb(239, 167, 174), &self.error);
+                        if ui.small_button("Dismiss").clicked() {
+                            self.error.clear();
+                        }
+                    });
+                });
+        }
+        if let Some(outgoing) = &self.outgoing {
+            let status = outgoing.state.lock().unwrap().status.clone();
+            let name = outgoing.device.name.clone();
+            egui::Frame::new().inner_margin(16.0).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("{name} / {status}"));
+                    if ui.button("Cancel").clicked() {
+                        self.outgoing.take();
+                    }
+                });
+            });
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(Color32::from_rgb(20, 21, 24)))
+            .show_inside(ui, |ui| {
+                if self.gallery {
+                    self.gallery_view(ui, &devices);
+                } else {
+                    self.remote_view(ui);
+                }
+            });
+        if self.settings_open {
+            self.settings_panel(&ctx);
+        }
+        if self.discovery.is_some() || self.outgoing.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
         self.route_input();
         if ctx.input(|i| i.viewport().close_requested()) {
             self.shutdown();
@@ -636,6 +1108,60 @@ mod tests {
         );
         app.select_session(10);
         assert_eq!(app.active, Some(1));
+    }
+
+    #[test]
+    fn gallery_never_routes_input_and_reopening_active_session_works() {
+        let mut app = app_with_sessions();
+        app.gallery = false;
+        app.controlling = true;
+        app.remote_rect = Some(Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        ));
+        app.show_gallery();
+        assert!(app.gallery && !app.controlling && app.remote_rect.is_none());
+        assert!(matches!(
+            app.sessions[0].viewer.test_inputs().as_slice(),
+            [Input::ReleaseAll]
+        ));
+        app.events.push(Event::PointerButton {
+            pos: egui::pos2(100.0, 100.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        app.route_input();
+        assert!(!app.controlling);
+        app.select_session(0);
+        assert!(!app.gallery && app.active == Some(0));
+    }
+
+    #[test]
+    fn gallery_draws_at_compact_and_desktop_sizes_without_control_area() {
+        for width in [480.0, 1080.0] {
+            let ctx = egui::Context::default();
+            let mut app = Localnet::new(&ctx);
+            let devices = vec![Device {
+                name: "Office Mac".into(),
+                address: "192.168.1.20:45778".parse().unwrap(),
+                certificate: vec![1],
+                version: crate::protocol::VERSION,
+            }];
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 720.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                app.header(ui);
+                app.gallery_view(ui, &devices);
+            });
+            assert!(!output.shapes.is_empty());
+            assert!(app.remote_rect.is_none() && !app.controlling);
+        }
     }
 
     #[test]
