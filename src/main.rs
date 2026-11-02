@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod branding;
 mod capture;
 mod chrome;
 mod discovery;
@@ -19,6 +20,8 @@ fn main() -> eframe::Result {
         eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_inner_size([1080.0, 720.0])
+                .with_icon(branding::app_icon())
+                .with_app_id("dev.localnet.desktop")
                 .with_min_inner_size([480.0, 360.0])
                 .with_transparent(cfg!(target_os = "windows"))
                 .with_fullsize_content_view(true)

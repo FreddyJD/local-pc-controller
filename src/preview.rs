@@ -91,9 +91,11 @@ struct Work {
 struct Completed {
     device: Device,
     image: Result<egui::ColorImage, String>,
+    refresh_discovery: bool,
 }
 
 pub struct Previews {
+    pub refresh_discovery: bool,
     pub thumbnails: HashMap<SocketAddr, Thumbnail>,
     sender: Option<SyncSender<Work>>,
     receiver: Receiver<Completed>,
@@ -112,19 +114,23 @@ impl Previews {
         let worker = thread::spawn(move || {
             let mut decoder = FrameDecoder::new().ok();
             while let Ok(work) = jobs.recv() {
-                let result = fetch_preview(&work.device, &work.life)
-                    .and_then(|bytes| {
-                        decoder
-                            .as_mut()
-                            .ok_or_else(|| anyhow::anyhow!("Preview decoder unavailable"))?
-                            .decode_bounded(&bytes, PREVIEW_WIDTH as usize, PREVIEW_HEIGHT as usize)
-                    })
-                    .map_err(|e| format!("{e:#}"));
+                let result = fetch_preview(&work.device, &work.life).and_then(|bytes| {
+                    decoder
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("Preview decoder unavailable"))?
+                        .decode_bounded(&bytes, PREVIEW_WIDTH as usize, PREVIEW_HEIGHT as usize)
+                });
+                let refresh_discovery = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(crate::transport::is_certificate_error);
+                let result = result.map_err(|e| format!("{e:#}"));
                 work.life.stop();
                 if done
                     .try_send(Completed {
                         device: work.device,
                         image: result,
+                        refresh_discovery,
                     })
                     .is_err()
                 {
@@ -133,6 +139,7 @@ impl Previews {
             }
         });
         Self {
+            refresh_discovery: false,
             thumbnails: HashMap::new(),
             sender: Some(sender),
             receiver,
@@ -163,6 +170,7 @@ impl Previews {
         }
         while let Ok(done) = self.receiver.try_recv() {
             self.running = None;
+            self.refresh_discovery |= done.refresh_discovery;
             if let Some(thumb) = self.thumbnails.get_mut(&done.device.address)
                 && same_device(&thumb.device, &done.device)
             {
@@ -283,5 +291,45 @@ mod tests {
         );
         previews.tick(&[], false);
         assert!(previews.thumbnails.is_empty());
+    }
+
+    #[test]
+    fn stale_preview_certificate_requests_rediscovery_without_accepting_connection() {
+        use rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
+        let name = crate::protocol::SERVER_NAME;
+        let identity = rcgen::generate_simple_self_signed(vec![name.into()]).unwrap();
+        let stale = rcgen::generate_simple_self_signed(vec![name.into()]).unwrap();
+        let config = Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![identity.cert.der().clone()],
+                    PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
+                )
+                .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let device = Device {
+            name: "Restarted Mac".into(),
+            address: listener.local_addr().unwrap(),
+            certificate: stale.cert.der().to_vec(),
+            version: crate::protocol::VERSION,
+        };
+        let server = thread::spawn(move || {
+            assert!(crate::transport::accept(listener.accept().unwrap().0, config).is_err())
+        });
+        let mut previews = Previews::new();
+        previews.tick(std::slice::from_ref(&device), true);
+        let until = Instant::now() + Duration::from_secs(5);
+        while !previews.refresh_discovery {
+            assert!(Instant::now() < until);
+            thread::sleep(Duration::from_millis(10));
+            previews.tick(std::slice::from_ref(&device), true);
+        }
+        let thumb = &previews.thumbnails[&device.address];
+        assert!(thumb.image.is_none() && thumb.error.is_some());
+        server.join().unwrap();
     }
 }

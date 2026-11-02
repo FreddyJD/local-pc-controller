@@ -48,6 +48,7 @@ pub struct Localnet {
     settings_open: bool,
     previews: Option<Previews>,
     thumbnails: HashMap<SocketAddr, TileTexture>,
+    logo: egui::TextureHandle,
 }
 
 impl Localnet {
@@ -134,6 +135,7 @@ impl Localnet {
             settings_open: false,
             previews: Some(Previews::new()),
             thumbnails: HashMap::new(),
+            logo: crate::branding::mark(ctx),
         }
     }
 
@@ -477,6 +479,7 @@ impl Localnet {
                         );
                     }
                 } else {
+                    ui.add(egui::Image::new(&self.logo).fit_to_exact_size(egui::vec2(23.0, 23.0)));
                     ui.label(egui::RichText::new("Localnet").size(15.0).strong());
                 }
             },
@@ -961,6 +964,11 @@ impl eframe::App for Localnet {
             });
         if let Some(previews) = &mut self.previews {
             previews.tick(&devices, previews_enabled);
+            if std::mem::take(&mut previews.refresh_discovery)
+                && let Some(discovery) = &self.discovery
+            {
+                discovery.refresh_nearby();
+            }
             self.thumbnails.retain(|address, tile| {
                 devices
                     .iter()

@@ -120,11 +120,11 @@ pub fn connect(
         DeadlineSocket::new(socket)?,
     );
     stream.conn.complete_io(&mut stream.sock)?;
-    if !stream
+    if stream
         .conn
         .peer_certificates()
         .and_then(|certs| certs.first())
-        .is_some_and(|cert| cert.as_ref() == pair.certificate.as_slice())
+        .is_none_or(|cert| cert.as_ref() != pair.certificate.as_slice())
     {
         return Err(anyhow::Error::new(rustls::Error::InvalidCertificate(
             rustls::CertificateError::ApplicationVerificationFailure,
